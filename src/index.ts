@@ -71,6 +71,11 @@ function normalizeBaseUrl(url: string): string {
 	return url.replace(/\/$/, "");
 }
 
+function maskApiKey(key: string): string {
+	if (key.length <= 8) return "●".repeat(key.length);
+	return key.slice(0, 4) + "●".repeat(Math.max(0, key.length - 8)) + key.slice(-4);
+}
+
 function applyEnvOverrides(config: NineRouterConfig): NineRouterConfig {
 	return {
 		baseUrl: normalizeBaseUrl(ENV_BASE_URL || config.baseUrl),
@@ -355,7 +360,7 @@ export default async function (pi: ExtensionAPI) {
 				`🔗 9router Status`,
 				``,
 				`Base URL:    ${config.baseUrl}`,
-				`API Key:     ${config.apiKey ? "✅ set" : "not set"}`,
+				`API Key:     ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
 				`Connection:  ${test.ok ? "🟢 connected" : `🔴 ${test.error || "disconnected"}`}`,
 				`Models:      ${discoveredModels.length} available`,
 			];
@@ -428,20 +433,22 @@ export default async function (pi: ExtensionAPI) {
 			const currentLines = [
 				"Current config:",
 				`  Base URL:  ${config.baseUrl}`,
-				`  API Key:   ${currentApiKeyDisplay}`,
+				`  API Key:   ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
 				`  Status:    ${currentStatus}`,
 				"",
-				"New values (press Enter to keep current):",
+				"Enter new values (press Enter to keep current):",
 			].join("\n");
 
 			const newBaseUrl = await ctx.ui.input(
 				currentLines,
+				"Base URL",
 				config.baseUrl,
 			);
 			if (newBaseUrl === undefined) return; // cancelled
 
 			const newApiKey = await ctx.ui.input(
 				"API key (press Enter to keep current, leave blank to remove):",
+				"API Key",
 				config.apiKey || "",
 			);
 			if (newApiKey === undefined) return; // cancelled
