@@ -25,7 +25,7 @@ pi install npm:pi-9router-ext
 
 ```bash
 # Clone or download this repo
-git clone https://github.com/yourusername/pi-9router-ext.git
+git clone https://github.com/irfansofyana/pi-9router-ext.git
 
 # Install locally
 pi install /path/to/pi-9router-ext
