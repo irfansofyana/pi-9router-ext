@@ -420,14 +420,28 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerCommand("9router-config", {
 		description: "Configure 9router base URL and API key",
 		handler: async (_args, ctx) => {
+			// Show current config first
+			const test = await testConnection(config, ctx.signal);
+			const currentStatus = test.ok ? "🟢 connected" : "🔴 disconnected";
+			const currentApiKeyDisplay = config.apiKey ? "●●●●●●●● (set)" : "not set";
+
+			const currentLines = [
+				"Current config:",
+				`  Base URL:  ${config.baseUrl}`,
+				`  API Key:   ${currentApiKeyDisplay}`,
+				`  Status:    ${currentStatus}`,
+				"",
+				"New values (press Enter to keep current):",
+			].join("\n");
+
 			const newBaseUrl = await ctx.ui.input(
-				"9router base URL:",
+				currentLines,
 				config.baseUrl,
 			);
 			if (newBaseUrl === undefined) return; // cancelled
 
 			const newApiKey = await ctx.ui.input(
-				"API key (leave blank for none):",
+				"API key (press Enter to keep current, leave blank to remove):",
 				config.apiKey || "",
 			);
 			if (newApiKey === undefined) return; // cancelled
