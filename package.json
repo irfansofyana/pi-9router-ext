@@ -1,0 +1,33 @@
+{
+  "name": "pi-9router-ext",
+  "version": "0.1.0",
+  "description": "Pi Coding Agent extension for 9router — connect to your 9router AI routing proxy instance",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "9router",
+    "ai-router",
+    "openai-proxy"
+  ],
+  "license": "MIT",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/pi-9router-ext.git"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  }
+}
