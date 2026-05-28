@@ -1,6 +1,10 @@
 # pi-9router-ext
 
+[![npm](https://img.shields.io/npm/v/pi-9router-ext?color=blue)](https://www.npmjs.com/package/pi-9router-ext)
+
 Pi Coding Agent extension for [9router](https://github.com/decolua/9router) — an open-source AI routing proxy.
+
+**Install:** `pi install npm:pi-9router-ext`
 
 Connects Pi to your 9router instance via its OpenAI-compatible API, with dynamic model discovery and interactive configuration.
 
@@ -15,7 +19,7 @@ Connects Pi to your 9router instance via its OpenAI-compatible API, with dynamic
 
 ## Installation
 
-### Via npm (when published)
+### npm (Recommended)
 
 ```bash
 pi install npm:pi-9router-ext
