@@ -13,7 +13,9 @@ Connects Pi to your 9router instance via its OpenAI-compatible API, with dynamic
 - **Auto-discovery** — Fetches available models and combos from 9router on startup
 - **Dynamic provider** — Registers 9router as a Pi provider with live model list
 - **Pi-native streaming** — Uses Pi's built-in OpenAI completions provider without overriding other providers
-- **Status commands** — `/9router-status`, `/9router-models`, `/9router-config`, `/9router-reload`
+- **Status commands** — `/9router-status`, `/9router-models`, `/9router-config`, `/9router-reasoning`, `/9router-reload`
+- **Manual reasoning toggle** — Optionally expose Pi thinking levels and send `reasoning_effort` to 9router
+- **Web tools** — Exposes 9router web search/fetch routes as LLM-callable Pi tools
 - **User-wide persistence** — Configuration survives new Pi instances via `~/.pi/agent/9router-config.json`
 - **Routing detection** — Captures upstream model info from response headers when available
 
@@ -38,11 +40,22 @@ pi install /path/to/pi-9router-ext
 pi -e /path/to/pi-9router-ext
 ```
 
-### Manual (copy to extensions)
+### Manual / development install
+
+Prefer installing the package directory instead of copying individual source files. The extension may include multiple files, tools, commands, and helper modules; installing the directory lets Pi read the package manifest and load everything declared there.
 
 ```bash
-cp -r pi-9router-ext/src/index.ts ~/.pi/agent/extensions/pi-9router-ext.ts
+# Clone or update the repo
+git clone https://github.com/irfansofyana/pi-9router-ext.git
+cd pi-9router-ext
+
+# Install this working tree into Pi
+pi install "$PWD"
+
+# Reload Pi, then use /9router-config
 ```
+
+Avoid copying only `src/index.ts` into `~/.pi/agent/extensions`. That bypasses `package.json` metadata and can miss companion files added by future features.
 
 ## Configuration
 
@@ -52,6 +65,7 @@ cp -r pi-9router-ext/src/index.ts ~/.pi/agent/extensions/pi-9router-ext.ts
 |----------|---------|-------------|
 | `NINE_ROUTER_BASE_URL` | `http://localhost:20128` | Your 9router instance URL |
 | `NINE_ROUTER_API_KEY` | — | API key if 9router has `REQUIRE_API_KEY=true` |
+| `NINE_ROUTER_ENABLE_REASONING` | `false` | Set to `true`/`1`/`on` to expose Pi thinking levels for 9router models |
 
 Set them in your shell profile or prefix your `pi` command:
 
@@ -61,11 +75,15 @@ NINE_ROUTER_BASE_URL=http://my-vps:20128 NINE_ROUTER_API_KEY=nr-... pi
 
 ### Interactive Configuration
 
-Use the `/9router-config` command inside Pi to set base URL and API key interactively. This is saved to `~/.pi/agent/9router-config.json` and is shared by new Pi instances. Environment variables still take precedence when set.
+Use the `/9router-config` command inside Pi to open a configuration menu for connection settings, reasoning, web defaults, and status/routes. This is saved to `~/.pi/agent/9router-config.json` and is shared by new Pi instances. Environment variables still take precedence when set.
 
 ```
 /9router-config
 ```
+
+Use `/9router-reasoning` to quickly enable or disable reasoning without changing the base URL or API key.
+
+Web search/fetch defaults are configured from discovered `GET /v1/models/web` routes inside `/9router-config`. Direct provider routes such as `brave/search` and `tavily/fetch` are supported, as are 9router web combos.
 
 ## Usage
 
@@ -85,18 +103,75 @@ Or browse interactively:
 /9router-models
 ```
 
+### Reasoning / Thinking Levels
+
+9router's `/v1/models` endpoint does not currently expose reliable per-model reasoning capability metadata. For safety, this extension keeps reasoning disabled by default.
+
+If your selected 9router route/model supports reasoning, enable the manual toggle:
+
+```
+/9router-reasoning
+```
+
+When enabled, Pi treats 9router models as reasoning-capable. Use Pi's normal thinking controls such as Shift+Tab, `--thinking high`, or model suffixes like `9router/cx/gpt-5.3-codex:high`. Pi sends OpenAI-style `reasoning_effort` values to 9router (`off → none`, `low`, `medium`, `high`, `xhigh`).
+
+### Web Search / Fetch Tools
+
+If 9router exposes web routes from `GET /v1/models/web`, this extension lets the LLM call them through Pi tools:
+
+- `ninerouter_web_search` — calls `POST /v1/search`
+- `ninerouter_web_fetch` — calls `POST /v1/web/fetch`
+
+Tools are always registered. If no matching web route is configured or discovered, they fail with an actionable message telling you to configure web defaults in `/9router-config`.
+
+Search supports all generic fields exposed by 9router:
+
+```json
+{
+  "query": "latest pi coding agent extension docs",
+  "route": "brave/search",
+  "max_results": 5,
+  "search_type": "web",
+  "country": "US",
+  "language": "en",
+  "time_range": "week",
+  "offset": 0,
+  "domain_filter": ["github.com"],
+  "content_options": {},
+  "provider_options": {}
+}
+```
+
+Fetch supports:
+
+```json
+{
+  "url": "https://example.com",
+  "route": "tavily/fetch",
+  "format": "markdown",
+  "max_characters": 12000
+}
+```
+
+`route` is optional. If omitted, the configured default route is used; if that route disappears, the extension falls back to the first discovered compatible route and records that in tool details/status. Per-call route overrides can be direct routes (`brave/search`, `tavily/fetch`) or combo names.
+
 ### Available Commands
 
 | Command | Description |
 |---------|-------------|
-| `/9router-status` | Show connection status, model count, and config |
+| `/9router-status` | Show connection status, model count, web route count, and config |
 | `/9router-models` | Browse and select from available 9router models |
-| `/9router-config` | Interactively configure base URL and API key |
-| `/9router-reload` | Refresh model list from 9router |
+| `/9router-config` | Menu for connection, reasoning, web defaults, and status/routes |
+| `/9router-reasoning` | Enable or disable Pi thinking levels for 9router models |
+| `/9router-reload` | Refresh model list and web routes from 9router |
 
-### Available Tool
+### Available Tools
 
-The LLM can call `ninerouter_status` to check connection status and list models programmatically.
+The LLM can call:
+
+- `ninerouter_status` — check connection status, model list, and web route defaults
+- `ninerouter_web_search` — search the web through 9router
+- `ninerouter_web_fetch` — fetch/extract URL content through 9router
 
 ## How It Works
 
@@ -106,10 +181,11 @@ The LLM can call `ninerouter_status` to check connection status and list models 
 │         │     /v1/chat/completions   │ (proxy)  │     │ (40+)       │
 └─────────┘                            └──────────┘     └─────────────┘
      │
-     │ 1. Fetches /v1/models on startup
+     │ 1. Fetches /v1/models and /v1/models/web on startup
      │ 2. Registers as provider "9router"
      │ 3. Uses pi-ai's normal OpenAI implementation for only 9router models
-     │ 4. Leaves built-in/non-9router model switching untouched
+     │ 4. Registers web search/fetch as Pi tools
+     │ 5. Leaves built-in/non-9router model switching untouched
 ```
 
 ## Troubleshooting
@@ -122,6 +198,11 @@ The LLM can call `ninerouter_status` to check connection status and list models 
 **"No 9router models discovered"**
 - 9router may have no active providers. Open the dashboard and connect a provider.
 - Use `/9router-reload` to retry discovery.
+
+**"No 9router web search/fetch route is configured or discovered"**
+- Open the 9router dashboard and connect a web provider such as Brave, Tavily, Exa, or a web combo.
+- Run `/9router-reload` or open `/9router-config` → `Web defaults` to refresh `/v1/models/web`.
+- Pick separate default routes for search and fetch if more than one route exists.
 
 **Models not showing in `/model` selector**
 - Ensure the extension loaded: check for "9router connected" notification on startup

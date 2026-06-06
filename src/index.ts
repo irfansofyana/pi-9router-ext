@@ -11,8 +11,9 @@
  * - User-persisted configuration shared by all Pi instances
  *
  * Environment variables:
- *   NINE_ROUTER_BASE_URL - 9router endpoint (default: http://localhost:20128)
- *   NINE_ROUTER_API_KEY  - API key if 9router requires authentication
+ *   NINE_ROUTER_BASE_URL         - 9router endpoint (default: http://localhost:20128)
+ *   NINE_ROUTER_API_KEY          - API key if 9router requires authentication
+ *   NINE_ROUTER_ENABLE_REASONING - expose Pi thinking levels and send reasoning_effort
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -20,6 +21,14 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import {
+	defaultRouteForKind,
+	fetchWebRoutes,
+	registerNineRouterWebTools,
+	routesByKind,
+	webRoutesSummary,
+	type NineRouterWebRoute,
+} from "./web.js";
 
 // =============================================================================
 // Types
@@ -28,6 +37,9 @@ import { Type } from "typebox";
 interface NineRouterConfig {
 	baseUrl: string;
 	apiKey: string | undefined;
+	enableReasoning: boolean;
+	webSearchRoute: string | undefined;
+	webFetchRoute: string | undefined;
 }
 
 interface NineRouterModel {
@@ -49,6 +61,7 @@ interface NineRouterModelsResponse {
 const DEFAULT_BASE_URL = "http://localhost:20128";
 const ENV_BASE_URL = process.env.NINE_ROUTER_BASE_URL;
 const ENV_API_KEY = process.env.NINE_ROUTER_API_KEY;
+const ENV_ENABLE_REASONING = process.env.NINE_ROUTER_ENABLE_REASONING;
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "9router-config.json");
 
 const CUSTOM_TYPE_CONFIG = "9router-config";
@@ -76,10 +89,21 @@ function maskApiKey(key: string): string {
 	return key.slice(0, 4) + "●".repeat(Math.max(0, key.length - 8)) + key.slice(-4);
 }
 
+function parseBooleanFlag(value: string | undefined): boolean | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (["1", "true", "yes", "on", "enabled"].includes(normalized)) return true;
+	if (["0", "false", "no", "off", "disabled"].includes(normalized)) return false;
+	return undefined;
+}
+
 function applyEnvOverrides(config: NineRouterConfig): NineRouterConfig {
 	return {
 		baseUrl: normalizeBaseUrl(ENV_BASE_URL || config.baseUrl),
 		apiKey: ENV_API_KEY || config.apiKey,
+		enableReasoning: parseBooleanFlag(ENV_ENABLE_REASONING) ?? config.enableReasoning,
+		webSearchRoute: config.webSearchRoute,
+		webFetchRoute: config.webFetchRoute,
 	};
 }
 
@@ -93,6 +117,13 @@ function loadConfigFromDisk(): NineRouterConfig | null {
 			apiKey: typeof data.apiKey === "string" && data.apiKey.trim()
 				? data.apiKey.trim()
 				: undefined,
+			enableReasoning: data.enableReasoning === true,
+			webSearchRoute: typeof data.webSearchRoute === "string" && data.webSearchRoute.trim()
+				? data.webSearchRoute.trim()
+				: undefined,
+			webFetchRoute: typeof data.webFetchRoute === "string" && data.webFetchRoute.trim()
+				? data.webFetchRoute.trim()
+				: undefined,
 		};
 	} catch (err) {
 		console.error("[pi-9router-ext] Failed to load persisted config:", err);
@@ -105,7 +136,13 @@ function saveConfigToDisk(config: NineRouterConfig) {
 		mkdirSync(dirname(CONFIG_PATH), { recursive: true });
 		writeFileSync(
 			CONFIG_PATH,
-			`${JSON.stringify({ baseUrl: config.baseUrl, apiKey: config.apiKey }, null, 2)}\n`,
+			`${JSON.stringify({
+				baseUrl: config.baseUrl,
+				apiKey: config.apiKey,
+				enableReasoning: config.enableReasoning,
+				webSearchRoute: config.webSearchRoute,
+				webFetchRoute: config.webFetchRoute,
+			}, null, 2)}\n`,
 			{ mode: 0o600 },
 		);
 	} catch (err) {
@@ -117,6 +154,9 @@ function getInitialConfig(): NineRouterConfig {
 	return applyEnvOverrides(loadConfigFromDisk() || {
 		baseUrl: DEFAULT_BASE_URL,
 		apiKey: undefined,
+		enableReasoning: false,
+		webSearchRoute: undefined,
+		webFetchRoute: undefined,
 	});
 }
 
@@ -128,6 +168,9 @@ function loadConfigFromSession(ctx: ExtensionContext): NineRouterConfig | null {
 				return applyEnvOverrides({
 					baseUrl: normalizeBaseUrl(data.baseUrl),
 					apiKey: data.apiKey,
+					enableReasoning: data.enableReasoning === true,
+					webSearchRoute: typeof data.webSearchRoute === "string" ? data.webSearchRoute : undefined,
+					webFetchRoute: typeof data.webFetchRoute === "string" ? data.webFetchRoute : undefined,
 				});
 			}
 		}
@@ -140,6 +183,9 @@ function persistConfig(pi: ExtensionAPI, config: NineRouterConfig) {
 	pi.appendEntry(CUSTOM_TYPE_CONFIG, {
 		baseUrl: config.baseUrl,
 		apiKey: config.apiKey,
+		enableReasoning: config.enableReasoning,
+		webSearchRoute: config.webSearchRoute,
+		webFetchRoute: config.webFetchRoute,
 	});
 }
 
@@ -204,22 +250,39 @@ async function testConnection(
 // Model Mapping
 // =============================================================================
 
-function mapNineRouterModel(model: NineRouterModel) {
+function mapNineRouterModel(model: NineRouterModel, enableReasoning: boolean) {
 	const isCombo = model.owned_by === "combo";
 
 	return {
 		id: model.id,
 		name: isCombo ? `🔀 ${model.id}` : model.id,
-		reasoning: false,
+		reasoning: enableReasoning,
+		...(enableReasoning ? {
+			// Pi levels are mapped to 9router's OpenAI-style reasoning_effort field.
+			// 9router currently does not expose per-model reasoning capabilities from
+			// /v1/models, so this is intentionally controlled by user config.
+			thinkingLevelMap: {
+				off: "none",
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+			},
+		} : {}),
 		input: ["text"] as ("text" | "image")[],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
 		maxTokens: 4096,
 		compat: {
-			// 9router is an OpenAI-compatible proxy; keep requests conservative so
-			// using this extension does not force built-in-provider-specific features.
+			// 9router is an OpenAI-compatible proxy. Its translators primarily read
+			// max_tokens, and as a proxy it should not receive OpenAI-only store=false
+			// unless explicitly known to support it.
+			supportsStore: false,
 			supportsDeveloperRole: false,
-			supportsReasoningEffort: false,
+			supportsReasoningEffort: enableReasoning,
+			maxTokensField: "max_tokens" as const,
+			thinkingFormat: "openai" as const,
 		},
 	};
 }
@@ -242,7 +305,7 @@ function registerNineRouterProvider(
 		baseUrl: `${config.baseUrl}/v1`,
 		apiKey: config.apiKey || "9router-no-api-key",
 		api: "openai-completions",
-		models: models.map(mapNineRouterModel),
+		models: models.map((model) => mapNineRouterModel(model, config.enableReasoning)),
 	});
 }
 
@@ -262,9 +325,22 @@ export default async function (pi: ExtensionAPI) {
 
 	// State that survives across the extension lifetime
 	let discoveredModels: NineRouterModel[] = [];
+	let discoveredWebRoutes: NineRouterWebRoute[] = [];
 	let lastRoutedModel: string | undefined;
 	let activeProvider: string | undefined;
 	let isConnected = false;
+
+	async function refreshWebRoutes(signal?: AbortSignal): Promise<NineRouterWebRoute[]> {
+		const routes = await fetchWebRoutes(config, signal);
+		discoveredWebRoutes = routes;
+		return routes;
+	}
+
+	registerNineRouterWebTools(
+		pi,
+		() => config,
+		() => discoveredWebRoutes,
+	);
 
 	// ---------------------------------------------------------------------------
 	// Provider registration (async factory = models available immediately)
@@ -285,6 +361,12 @@ export default async function (pi: ExtensionAPI) {
 		unregisterNineRouterProvider(pi);
 	}
 
+	try {
+		await refreshWebRoutes();
+	} catch (err) {
+		console.error("[pi-9router-ext] Failed to discover web routes from 9router:", err);
+	}
+
 	// ---------------------------------------------------------------------------
 	// Session start: rehydrate config from session
 	// ---------------------------------------------------------------------------
@@ -299,6 +381,9 @@ export default async function (pi: ExtensionAPI) {
 				discoveredModels = models;
 				isConnected = true;
 				registerNineRouterProvider(pi, config, models);
+				await refreshWebRoutes(ctx.signal).catch((err) => {
+					console.error("[pi-9router-ext] Failed to refresh migrated web routes:", err);
+				});
 			} catch (err) {
 				isConnected = false;
 				console.error("[pi-9router-ext] Failed to refresh migrated config:", err);
@@ -307,7 +392,7 @@ export default async function (pi: ExtensionAPI) {
 
 		if (isConnected && discoveredModels.length > 0) {
 			ctx.ui.notify(
-				`9router connected — ${discoveredModels.length} models available`,
+				`9router connected — ${discoveredModels.length} models, ${routesByKind(discoveredWebRoutes, "webSearch").length} search routes, ${routesByKind(discoveredWebRoutes, "webFetch").length} fetch routes available`,
 				"info",
 			);
 		} else {
@@ -361,8 +446,10 @@ export default async function (pi: ExtensionAPI) {
 				``,
 				`Base URL:    ${config.baseUrl}`,
 				`API Key:     ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
+				`Reasoning:   ${config.enableReasoning ? "enabled (manual)" : "disabled"}`,
 				`Connection:  ${test.ok ? "🟢 connected" : `🔴 ${test.error || "disconnected"}`}`,
 				`Models:      ${discoveredModels.length} available`,
+				...webRoutesSummary(discoveredWebRoutes, config),
 			];
 
 			if (lastRoutedModel) {
@@ -423,61 +510,187 @@ export default async function (pi: ExtensionAPI) {
 	// Command: /9router-config
 	// ---------------------------------------------------------------------------
 	pi.registerCommand("9router-config", {
-		description: "Configure 9router base URL and API key",
+		description: "Configure 9router connection, reasoning, and web defaults",
 		handler: async (_args, ctx) => {
-			// Show current config first
-			const test = await testConnection(config, ctx.signal);
-			const currentStatus = test.ok ? "🟢 connected" : "🔴 disconnected";
-			const currentApiKeyDisplay = config.apiKey ? "●●●●●●●● (set)" : "not set";
+			while (true) {
+				const choice = await ctx.ui.select(
+					"9router configuration",
+					[
+						"Connection",
+						"Reasoning",
+						"Web defaults",
+						"View status/routes",
+						"Done",
+					],
+				);
+				if (!choice || choice === "Done") return;
 
-			const currentLines = [
-				"Current config:",
-				`  Base URL:  ${config.baseUrl}`,
-				`  API Key:   ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
-				`  Status:    ${currentStatus}`,
-				"",
-				"Enter new values (press Enter to keep current):",
-			].join("\n");
+				if (choice === "Connection") {
+					const test = await testConnection(config, ctx.signal);
+					const currentLines = [
+						"Current connection:",
+						`  Base URL: ${config.baseUrl}`,
+						`  API Key:  ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
+						`  Status:   ${test.ok ? "🟢 connected" : `🔴 ${test.error || "disconnected"}`}`,
+						"",
+						"Enter new values (press Enter to keep current):",
+					].join("\n");
 
-			const newBaseUrl = await ctx.ui.input(
-				currentLines,
-				"Base URL",
-				config.baseUrl,
+					const newBaseUrl = await ctx.ui.input(currentLines, config.baseUrl);
+					if (newBaseUrl === undefined) continue;
+
+					const newApiKey = await ctx.ui.input(
+						"API key (press Enter to keep current; type '-' to remove):",
+						config.apiKey ? "current key hidden" : "API Key",
+					);
+					if (newApiKey === undefined) continue;
+
+					const apiKeyInput = newApiKey.trim();
+					config = {
+						...config,
+						baseUrl: normalizeBaseUrl(newBaseUrl.trim() || config.baseUrl),
+						apiKey: apiKeyInput === "-"
+							? undefined
+							: apiKeyInput || config.apiKey,
+					};
+					persistConfig(pi, config);
+
+					try {
+						const models = await fetchModels(config, ctx.signal);
+						discoveredModels = models;
+						isConnected = true;
+						registerNineRouterProvider(pi, config, models);
+						await refreshWebRoutes(ctx.signal).catch((err) => {
+							console.error("[pi-9router-ext] Failed to refresh web routes:", err);
+						});
+						ctx.ui.notify(`9router connection updated — ${models.length} models`, "info");
+					} catch (err) {
+						isConnected = false;
+						unregisterNineRouterProvider(pi);
+						const msg = err instanceof Error ? err.message : String(err);
+						ctx.ui.notify(`Failed to connect: ${msg}`, "error");
+					}
+				}
+
+				if (choice === "Reasoning") {
+					const reasoningChoice = await ctx.ui.select(
+						`9router reasoning is currently ${config.enableReasoning ? "enabled" : "disabled"}. Enable only for routes/models that support reasoning.`,
+						["Enable reasoning", "Disable reasoning"],
+					);
+					if (!reasoningChoice) continue;
+					config = {
+						...config,
+						enableReasoning: reasoningChoice === "Enable reasoning",
+					};
+					persistConfig(pi, config);
+					if (discoveredModels.length > 0) {
+						registerNineRouterProvider(pi, config, discoveredModels);
+					}
+					ctx.ui.notify(`9router reasoning ${config.enableReasoning ? "enabled" : "disabled"}`, "info");
+				}
+
+				if (choice === "Web defaults") {
+					try {
+						await refreshWebRoutes(ctx.signal);
+					} catch (err) {
+						const msg = err instanceof Error ? err.message : String(err);
+						ctx.ui.notify(`Failed to refresh web routes: ${msg}`, "error");
+						continue;
+					}
+
+					const searchRoutes = routesByKind(discoveredWebRoutes, "webSearch");
+					const fetchRoutes = routesByKind(discoveredWebRoutes, "webFetch");
+
+					if (searchRoutes.length > 0) {
+						const searchOptions = ["Auto (first available)", ...searchRoutes.map((route) => route.id)];
+						const searchChoice = await ctx.ui.select(
+							`Default web search route (current: ${config.webSearchRoute || defaultRouteForKind(discoveredWebRoutes, "webSearch") || "auto"})`,
+							searchOptions,
+						);
+						if (searchChoice) {
+							config = {
+								...config,
+								webSearchRoute: searchChoice === "Auto (first available)" ? undefined : searchChoice,
+							};
+						}
+					} else {
+						ctx.ui.notify("No 9router web search routes discovered", "warning");
+					}
+
+					if (fetchRoutes.length > 0) {
+						const fetchOptions = ["Auto (first available)", ...fetchRoutes.map((route) => route.id)];
+						const fetchChoice = await ctx.ui.select(
+							`Default web fetch route (current: ${config.webFetchRoute || defaultRouteForKind(discoveredWebRoutes, "webFetch") || "auto"})`,
+							fetchOptions,
+						);
+						if (fetchChoice) {
+							config = {
+								...config,
+								webFetchRoute: fetchChoice === "Auto (first available)" ? undefined : fetchChoice,
+							};
+						}
+					} else {
+						ctx.ui.notify("No 9router web fetch routes discovered", "warning");
+					}
+
+					persistConfig(pi, config);
+					ctx.ui.notify(webRoutesSummary(discoveredWebRoutes, config).join("\n"), "info");
+				}
+
+				if (choice === "View status/routes") {
+					const test = await testConnection(config, ctx.signal);
+					const lines = [
+						"🔗 9router Status",
+						"",
+						`Base URL:    ${config.baseUrl}`,
+						`API Key:     ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
+						`Reasoning:   ${config.enableReasoning ? "enabled" : "disabled"}`,
+						`Connection:  ${test.ok ? "🟢 connected" : `🔴 ${test.error || "disconnected"}`}`,
+						`Models:      ${discoveredModels.length} available`,
+						...webRoutesSummary(discoveredWebRoutes, config),
+						"",
+						"Web search routes:",
+						...routesByKind(discoveredWebRoutes, "webSearch").map((route) => `  - ${route.id}${route.owned_by === "combo" ? " (combo)" : ""}`),
+						"Web fetch routes:",
+						...routesByKind(discoveredWebRoutes, "webFetch").map((route) => `  - ${route.id}${route.owned_by === "combo" ? " (combo)" : ""}`),
+					];
+					ctx.ui.notify(lines.join("\n"), test.ok ? "info" : "warning");
+				}
+			}
+		},
+	});
+
+	// ---------------------------------------------------------------------------
+	// Command: /9router-reasoning
+	// ---------------------------------------------------------------------------
+	pi.registerCommand("9router-reasoning", {
+		description: "Enable or disable Pi thinking levels for 9router models",
+		handler: async (_args, ctx) => {
+			const choice = await ctx.ui.select(
+				`9router reasoning is currently ${config.enableReasoning ? "enabled" : "disabled"}. When enabled, Pi exposes thinking levels and sends reasoning_effort to 9router.`,
+				[
+					"Enable reasoning",
+					"Disable reasoning",
+				],
 			);
-			if (newBaseUrl === undefined) return; // cancelled
-
-			const newApiKey = await ctx.ui.input(
-				"API key (press Enter to keep current, leave blank to remove):",
-				"API Key",
-				config.apiKey || "",
-			);
-			if (newApiKey === undefined) return; // cancelled
+			if (!choice) return;
 
 			config = {
-				baseUrl: normalizeBaseUrl(newBaseUrl),
-				apiKey: newApiKey.trim() || undefined,
+				...config,
+				enableReasoning: choice === "Enable reasoning",
 			};
-
 			persistConfig(pi, config);
 
-			// Try to refresh models and re-register provider
-			try {
-				const models = await fetchModels(config, ctx.signal);
-				discoveredModels = models;
-				isConnected = true;
-
-				registerNineRouterProvider(pi, config, models);
-
-				ctx.ui.notify(
-					`9router updated — ${models.length} models at ${config.baseUrl}`,
-					"info",
-				);
-			} catch (err) {
-				isConnected = false;
-				unregisterNineRouterProvider(pi);
-				const msg = err instanceof Error ? err.message : String(err);
-				ctx.ui.notify(`Failed to connect: ${msg}`, "error");
+			if (discoveredModels.length > 0) {
+				registerNineRouterProvider(pi, config, discoveredModels);
 			}
+
+			ctx.ui.notify(
+				config.enableReasoning
+					? "9router reasoning enabled. Use Pi's thinking controls (Shift+Tab or --thinking) to choose the level."
+					: "9router reasoning disabled. 9router models will use thinking level off.",
+				"info",
+			);
 		},
 	});
 
@@ -493,9 +706,12 @@ export default async function (pi: ExtensionAPI) {
 				isConnected = true;
 
 				registerNineRouterProvider(pi, config, models);
+				await refreshWebRoutes(ctx.signal).catch((err) => {
+					console.error("[pi-9router-ext] Failed to reload web routes:", err);
+				});
 
 				ctx.ui.notify(
-					`9router reloaded — ${models.length} models`,
+					`9router reloaded — ${models.length} models, ${routesByKind(discoveredWebRoutes, "webSearch").length} search routes, ${routesByKind(discoveredWebRoutes, "webFetch").length} fetch routes (${config.enableReasoning ? "reasoning enabled" : "reasoning disabled"})`,
 					"info",
 				);
 			} catch (err) {
@@ -528,9 +744,11 @@ export default async function (pi: ExtensionAPI) {
 						text: [
 							`9router: ${test.ok ? "connected" : `disconnected (${test.error})`}`,
 							`Base URL: ${config.baseUrl}`,
+							`Reasoning: ${config.enableReasoning ? "enabled" : "disabled"}`,
 							`Total models: ${discoveredModels.length}`,
 							`  Regular: ${regular.length}`,
 							`  Combos:  ${combos.length}`,
+							...webRoutesSummary(discoveredWebRoutes, config),
 							lastRoutedModel
 								? `Last routed model: ${lastRoutedModel}`
 								: "",
@@ -542,9 +760,14 @@ export default async function (pi: ExtensionAPI) {
 				details: {
 					connected: test.ok,
 					baseUrl: config.baseUrl,
+					enableReasoning: config.enableReasoning,
 					modelCount: discoveredModels.length,
 					regularCount: regular.length,
 					comboCount: combos.length,
+					webSearchRoutes: routesByKind(discoveredWebRoutes, "webSearch").map((route) => route.id),
+					webFetchRoutes: routesByKind(discoveredWebRoutes, "webFetch").map((route) => route.id),
+					webSearchRoute: config.webSearchRoute,
+					webFetchRoute: config.webFetchRoute,
 					lastRoutedModel,
 					models: discoveredModels.map((m) => m.id),
 				},
