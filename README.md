@@ -40,11 +40,22 @@ pi install /path/to/pi-9router-ext
 pi -e /path/to/pi-9router-ext
 ```
 
-### Manual (copy to extensions)
+### Manual / development install
+
+Prefer installing the package directory instead of copying individual source files. The extension may include multiple files, tools, commands, and helper modules; installing the directory lets Pi read the package manifest and load everything declared there.
 
 ```bash
-cp -r pi-9router-ext/src/index.ts ~/.pi/agent/extensions/pi-9router-ext.ts
+# Clone or update the repo
+git clone https://github.com/irfansofyana/pi-9router-ext.git
+cd pi-9router-ext
+
+# Install this working tree into Pi
+pi install "$PWD"
+
+# Reload Pi, then use /9router-config
 ```
+
+Avoid copying only `src/index.ts` into `~/.pi/agent/extensions`. That bypasses `package.json` metadata and can miss companion files added by future features.
 
 ## Configuration
 
