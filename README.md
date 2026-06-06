@@ -13,7 +13,8 @@ Connects Pi to your 9router instance via its OpenAI-compatible API, with dynamic
 - **Auto-discovery** — Fetches available models and combos from 9router on startup
 - **Dynamic provider** — Registers 9router as a Pi provider with live model list
 - **Pi-native streaming** — Uses Pi's built-in OpenAI completions provider without overriding other providers
-- **Status commands** — `/9router-status`, `/9router-models`, `/9router-config`, `/9router-reload`
+- **Status commands** — `/9router-status`, `/9router-models`, `/9router-config`, `/9router-reasoning`, `/9router-reload`
+- **Manual reasoning toggle** — Optionally expose Pi thinking levels and send `reasoning_effort` to 9router
 - **User-wide persistence** — Configuration survives new Pi instances via `~/.pi/agent/9router-config.json`
 - **Routing detection** — Captures upstream model info from response headers when available
 
@@ -52,6 +53,7 @@ cp -r pi-9router-ext/src/index.ts ~/.pi/agent/extensions/pi-9router-ext.ts
 |----------|---------|-------------|
 | `NINE_ROUTER_BASE_URL` | `http://localhost:20128` | Your 9router instance URL |
 | `NINE_ROUTER_API_KEY` | — | API key if 9router has `REQUIRE_API_KEY=true` |
+| `NINE_ROUTER_ENABLE_REASONING` | `false` | Set to `true`/`1`/`on` to expose Pi thinking levels for 9router models |
 
 Set them in your shell profile or prefix your `pi` command:
 
@@ -61,11 +63,13 @@ NINE_ROUTER_BASE_URL=http://my-vps:20128 NINE_ROUTER_API_KEY=nr-... pi
 
 ### Interactive Configuration
 
-Use the `/9router-config` command inside Pi to set base URL and API key interactively. This is saved to `~/.pi/agent/9router-config.json` and is shared by new Pi instances. Environment variables still take precedence when set.
+Use the `/9router-config` command inside Pi to set base URL, API key, and the manual reasoning toggle interactively. This is saved to `~/.pi/agent/9router-config.json` and is shared by new Pi instances. Environment variables still take precedence when set.
 
 ```
 /9router-config
 ```
+
+Use `/9router-reasoning` to quickly enable or disable reasoning without changing the base URL or API key.
 
 ## Usage
 
@@ -85,13 +89,26 @@ Or browse interactively:
 /9router-models
 ```
 
+### Reasoning / Thinking Levels
+
+9router's `/v1/models` endpoint does not currently expose reliable per-model reasoning capability metadata. For safety, this extension keeps reasoning disabled by default.
+
+If your selected 9router route/model supports reasoning, enable the manual toggle:
+
+```
+/9router-reasoning
+```
+
+When enabled, Pi treats 9router models as reasoning-capable. Use Pi's normal thinking controls such as Shift+Tab, `--thinking high`, or model suffixes like `9router/cx/gpt-5.3-codex:high`. Pi sends OpenAI-style `reasoning_effort` values to 9router (`off → none`, `low`, `medium`, `high`, `xhigh`).
+
 ### Available Commands
 
 | Command | Description |
 |---------|-------------|
 | `/9router-status` | Show connection status, model count, and config |
 | `/9router-models` | Browse and select from available 9router models |
-| `/9router-config` | Interactively configure base URL and API key |
+| `/9router-config` | Interactively configure base URL, API key, and reasoning toggle |
+| `/9router-reasoning` | Enable or disable Pi thinking levels for 9router models |
 | `/9router-reload` | Refresh model list from 9router |
 
 ### Available Tool

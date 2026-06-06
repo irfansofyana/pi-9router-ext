@@ -11,8 +11,9 @@
  * - User-persisted configuration shared by all Pi instances
  *
  * Environment variables:
- *   NINE_ROUTER_BASE_URL - 9router endpoint (default: http://localhost:20128)
- *   NINE_ROUTER_API_KEY  - API key if 9router requires authentication
+ *   NINE_ROUTER_BASE_URL         - 9router endpoint (default: http://localhost:20128)
+ *   NINE_ROUTER_API_KEY          - API key if 9router requires authentication
+ *   NINE_ROUTER_ENABLE_REASONING - expose Pi thinking levels and send reasoning_effort
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -28,6 +29,7 @@ import { Type } from "typebox";
 interface NineRouterConfig {
 	baseUrl: string;
 	apiKey: string | undefined;
+	enableReasoning: boolean;
 }
 
 interface NineRouterModel {
@@ -49,6 +51,7 @@ interface NineRouterModelsResponse {
 const DEFAULT_BASE_URL = "http://localhost:20128";
 const ENV_BASE_URL = process.env.NINE_ROUTER_BASE_URL;
 const ENV_API_KEY = process.env.NINE_ROUTER_API_KEY;
+const ENV_ENABLE_REASONING = process.env.NINE_ROUTER_ENABLE_REASONING;
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "9router-config.json");
 
 const CUSTOM_TYPE_CONFIG = "9router-config";
@@ -76,10 +79,19 @@ function maskApiKey(key: string): string {
 	return key.slice(0, 4) + "●".repeat(Math.max(0, key.length - 8)) + key.slice(-4);
 }
 
+function parseBooleanFlag(value: string | undefined): boolean | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (["1", "true", "yes", "on", "enabled"].includes(normalized)) return true;
+	if (["0", "false", "no", "off", "disabled"].includes(normalized)) return false;
+	return undefined;
+}
+
 function applyEnvOverrides(config: NineRouterConfig): NineRouterConfig {
 	return {
 		baseUrl: normalizeBaseUrl(ENV_BASE_URL || config.baseUrl),
 		apiKey: ENV_API_KEY || config.apiKey,
+		enableReasoning: parseBooleanFlag(ENV_ENABLE_REASONING) ?? config.enableReasoning,
 	};
 }
 
@@ -93,6 +105,7 @@ function loadConfigFromDisk(): NineRouterConfig | null {
 			apiKey: typeof data.apiKey === "string" && data.apiKey.trim()
 				? data.apiKey.trim()
 				: undefined,
+			enableReasoning: data.enableReasoning === true,
 		};
 	} catch (err) {
 		console.error("[pi-9router-ext] Failed to load persisted config:", err);
@@ -105,7 +118,11 @@ function saveConfigToDisk(config: NineRouterConfig) {
 		mkdirSync(dirname(CONFIG_PATH), { recursive: true });
 		writeFileSync(
 			CONFIG_PATH,
-			`${JSON.stringify({ baseUrl: config.baseUrl, apiKey: config.apiKey }, null, 2)}\n`,
+			`${JSON.stringify({
+				baseUrl: config.baseUrl,
+				apiKey: config.apiKey,
+				enableReasoning: config.enableReasoning,
+			}, null, 2)}\n`,
 			{ mode: 0o600 },
 		);
 	} catch (err) {
@@ -117,6 +134,7 @@ function getInitialConfig(): NineRouterConfig {
 	return applyEnvOverrides(loadConfigFromDisk() || {
 		baseUrl: DEFAULT_BASE_URL,
 		apiKey: undefined,
+		enableReasoning: false,
 	});
 }
 
@@ -128,6 +146,7 @@ function loadConfigFromSession(ctx: ExtensionContext): NineRouterConfig | null {
 				return applyEnvOverrides({
 					baseUrl: normalizeBaseUrl(data.baseUrl),
 					apiKey: data.apiKey,
+					enableReasoning: data.enableReasoning === true,
 				});
 			}
 		}
@@ -140,6 +159,7 @@ function persistConfig(pi: ExtensionAPI, config: NineRouterConfig) {
 	pi.appendEntry(CUSTOM_TYPE_CONFIG, {
 		baseUrl: config.baseUrl,
 		apiKey: config.apiKey,
+		enableReasoning: config.enableReasoning,
 	});
 }
 
@@ -204,22 +224,39 @@ async function testConnection(
 // Model Mapping
 // =============================================================================
 
-function mapNineRouterModel(model: NineRouterModel) {
+function mapNineRouterModel(model: NineRouterModel, enableReasoning: boolean) {
 	const isCombo = model.owned_by === "combo";
 
 	return {
 		id: model.id,
 		name: isCombo ? `🔀 ${model.id}` : model.id,
-		reasoning: false,
+		reasoning: enableReasoning,
+		...(enableReasoning ? {
+			// Pi levels are mapped to 9router's OpenAI-style reasoning_effort field.
+			// 9router currently does not expose per-model reasoning capabilities from
+			// /v1/models, so this is intentionally controlled by user config.
+			thinkingLevelMap: {
+				off: "none",
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+			},
+		} : {}),
 		input: ["text"] as ("text" | "image")[],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
 		maxTokens: 4096,
 		compat: {
-			// 9router is an OpenAI-compatible proxy; keep requests conservative so
-			// using this extension does not force built-in-provider-specific features.
+			// 9router is an OpenAI-compatible proxy. Its translators primarily read
+			// max_tokens, and as a proxy it should not receive OpenAI-only store=false
+			// unless explicitly known to support it.
+			supportsStore: false,
 			supportsDeveloperRole: false,
-			supportsReasoningEffort: false,
+			supportsReasoningEffort: enableReasoning,
+			maxTokensField: "max_tokens" as const,
+			thinkingFormat: "openai" as const,
 		},
 	};
 }
@@ -242,7 +279,7 @@ function registerNineRouterProvider(
 		baseUrl: `${config.baseUrl}/v1`,
 		apiKey: config.apiKey || "9router-no-api-key",
 		api: "openai-completions",
-		models: models.map(mapNineRouterModel),
+		models: models.map((model) => mapNineRouterModel(model, config.enableReasoning)),
 	});
 }
 
@@ -361,6 +398,7 @@ export default async function (pi: ExtensionAPI) {
 				``,
 				`Base URL:    ${config.baseUrl}`,
 				`API Key:     ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
+				`Reasoning:   ${config.enableReasoning ? "enabled (manual)" : "disabled"}`,
 				`Connection:  ${test.ok ? "🟢 connected" : `🔴 ${test.error || "disconnected"}`}`,
 				`Models:      ${discoveredModels.length} available`,
 			];
@@ -423,39 +461,53 @@ export default async function (pi: ExtensionAPI) {
 	// Command: /9router-config
 	// ---------------------------------------------------------------------------
 	pi.registerCommand("9router-config", {
-		description: "Configure 9router base URL and API key",
+		description: "Configure 9router base URL, API key, and reasoning support",
 		handler: async (_args, ctx) => {
 			// Show current config first
 			const test = await testConnection(config, ctx.signal);
 			const currentStatus = test.ok ? "🟢 connected" : "🔴 disconnected";
-			const currentApiKeyDisplay = config.apiKey ? "●●●●●●●● (set)" : "not set";
 
 			const currentLines = [
 				"Current config:",
-				`  Base URL:  ${config.baseUrl}`,
-				`  API Key:   ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
-				`  Status:    ${currentStatus}`,
+				`  Base URL:   ${config.baseUrl}`,
+				`  API Key:    ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
+				`  Reasoning:  ${config.enableReasoning ? "enabled" : "disabled"}`,
+				`  Status:     ${currentStatus}`,
 				"",
 				"Enter new values (press Enter to keep current):",
 			].join("\n");
 
 			const newBaseUrl = await ctx.ui.input(
 				currentLines,
-				"Base URL",
 				config.baseUrl,
 			);
 			if (newBaseUrl === undefined) return; // cancelled
 
 			const newApiKey = await ctx.ui.input(
-				"API key (press Enter to keep current, leave blank to remove):",
-				"API Key",
-				config.apiKey || "",
+				"API key (press Enter to keep current; type '-' to remove):",
+				config.apiKey ? "current key hidden" : "API Key",
 			);
 			if (newApiKey === undefined) return; // cancelled
 
+			const reasoningChoice = await ctx.ui.select(
+				"Expose Pi thinking levels for 9router models? When enabled, Pi sends reasoning_effort to 9router. Enable only for routes/models that support reasoning.",
+				[
+					"Keep current",
+					"Enable reasoning",
+					"Disable reasoning",
+				],
+			);
+			if (!reasoningChoice) return; // cancelled
+
+			const apiKeyInput = newApiKey.trim();
 			config = {
-				baseUrl: normalizeBaseUrl(newBaseUrl),
-				apiKey: newApiKey.trim() || undefined,
+				baseUrl: normalizeBaseUrl(newBaseUrl.trim() || config.baseUrl),
+				apiKey: apiKeyInput === "-"
+					? undefined
+					: apiKeyInput || config.apiKey,
+				enableReasoning: reasoningChoice === "Keep current"
+					? config.enableReasoning
+					: reasoningChoice === "Enable reasoning",
 			};
 
 			persistConfig(pi, config);
@@ -469,7 +521,7 @@ export default async function (pi: ExtensionAPI) {
 				registerNineRouterProvider(pi, config, models);
 
 				ctx.ui.notify(
-					`9router updated — ${models.length} models at ${config.baseUrl}`,
+					`9router updated — ${models.length} models at ${config.baseUrl} (${config.enableReasoning ? "reasoning enabled" : "reasoning disabled"})`,
 					"info",
 				);
 			} catch (err) {
@@ -478,6 +530,40 @@ export default async function (pi: ExtensionAPI) {
 				const msg = err instanceof Error ? err.message : String(err);
 				ctx.ui.notify(`Failed to connect: ${msg}`, "error");
 			}
+		},
+	});
+
+	// ---------------------------------------------------------------------------
+	// Command: /9router-reasoning
+	// ---------------------------------------------------------------------------
+	pi.registerCommand("9router-reasoning", {
+		description: "Enable or disable Pi thinking levels for 9router models",
+		handler: async (_args, ctx) => {
+			const choice = await ctx.ui.select(
+				`9router reasoning is currently ${config.enableReasoning ? "enabled" : "disabled"}. When enabled, Pi exposes thinking levels and sends reasoning_effort to 9router.`,
+				[
+					"Enable reasoning",
+					"Disable reasoning",
+				],
+			);
+			if (!choice) return;
+
+			config = {
+				...config,
+				enableReasoning: choice === "Enable reasoning",
+			};
+			persistConfig(pi, config);
+
+			if (discoveredModels.length > 0) {
+				registerNineRouterProvider(pi, config, discoveredModels);
+			}
+
+			ctx.ui.notify(
+				config.enableReasoning
+					? "9router reasoning enabled. Use Pi's thinking controls (Shift+Tab or --thinking) to choose the level."
+					: "9router reasoning disabled. 9router models will use thinking level off.",
+				"info",
+			);
 		},
 	});
 
@@ -495,7 +581,7 @@ export default async function (pi: ExtensionAPI) {
 				registerNineRouterProvider(pi, config, models);
 
 				ctx.ui.notify(
-					`9router reloaded — ${models.length} models`,
+					`9router reloaded — ${models.length} models (${config.enableReasoning ? "reasoning enabled" : "reasoning disabled"})`,
 					"info",
 				);
 			} catch (err) {
@@ -528,6 +614,7 @@ export default async function (pi: ExtensionAPI) {
 						text: [
 							`9router: ${test.ok ? "connected" : `disconnected (${test.error})`}`,
 							`Base URL: ${config.baseUrl}`,
+							`Reasoning: ${config.enableReasoning ? "enabled" : "disabled"}`,
 							`Total models: ${discoveredModels.length}`,
 							`  Regular: ${regular.length}`,
 							`  Combos:  ${combos.length}`,
@@ -542,6 +629,7 @@ export default async function (pi: ExtensionAPI) {
 				details: {
 					connected: test.ok,
 					baseUrl: config.baseUrl,
+					enableReasoning: config.enableReasoning,
 					modelCount: discoveredModels.length,
 					regularCount: regular.length,
 					comboCount: combos.length,
