@@ -12,6 +12,8 @@ Connects Pi to your 9router instance via its OpenAI-compatible API, with dynamic
 
 - **Auto-discovery** — Fetches available models and combos from 9router on startup
 - **Dynamic provider** — Registers 9router as a Pi provider with live model list
+- **Model metadata fallback** — Uses live router metadata when present, then cached models.dev metadata for context windows, output limits, and modalities
+- **Graceful startup** — Loads commands/tools immediately and discovers 9router models in the background so Pi remains usable before API keys or routes are configured
 - **Pi-native streaming** — Uses Pi's built-in OpenAI completions provider without overriding other providers
 - **Status commands** — `/9router-status`, `/9router-models`, `/9router-config`, `/9router-reasoning`, `/9router-reload`
 - **Manual reasoning toggle** — Optionally expose Pi thinking levels and send `reasoning_effort` to 9router
@@ -84,6 +86,10 @@ Use the `/9router-config` command inside Pi to open a configuration menu for con
 Use `/9router-reasoning` to quickly enable or disable reasoning without changing the base URL or API key.
 
 Web search/fetch defaults are configured from discovered `GET /v1/models/web` routes inside `/9router-config`. Direct provider routes such as `brave/search` and `tavily/fetch` are supported, as are 9router web combos.
+
+### Model Limits and Metadata
+
+9router-compatible `/v1/models` responses may only include `id`, `object`, and `owned_by`. When context/output limits are absent, the extension fills them from cached models.dev metadata at `~/.cache/pi/9router-model-metadata.json` (or `$XDG_CACHE_HOME/pi/9router-model-metadata.json`). Router-provided fields still take priority when available. If neither source has metadata, safe defaults are used: `128000` context tokens and a conservative `4096` output tokens.
 
 ## Usage
 
@@ -189,6 +195,11 @@ The LLM can call:
 ```
 
 ## Troubleshooting
+
+**"9router not configured" or no 9router models after install**
+- This is expected before 9router is reachable or before an API key is configured.
+- Pi remains usable; the extension discovers models in the background and registers the `9router` provider only after discovery succeeds.
+- Run `/9router-config` to set connection details, then `/9router-reload`.
 
 **"Failed to discover models from 9router"**
 - Check that 9router is running: `curl http://localhost:20128/v1/models`

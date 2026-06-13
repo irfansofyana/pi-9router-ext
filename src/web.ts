@@ -47,6 +47,7 @@ const DEFAULT_SEARCH_RESULTS = 5;
 const MAX_SEARCH_RESULTS = 20;
 const DEFAULT_FETCH_CHARACTERS = 12000;
 const MAX_FETCH_CHARACTERS = 50000;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 function authHeaders(config: NineRouterWebConfig): Record<string, string> {
 	const headers: Record<string, string> = {
@@ -81,46 +82,94 @@ async function parseJsonResponse(response: Response): Promise<unknown> {
 	}
 }
 
+function createTimeoutSignal(signal: AbortSignal | undefined, timeoutMs: number) {
+	const controller = new AbortController();
+	const abort = () => controller.abort();
+	const timer = setTimeout(abort, timeoutMs);
+	timer.unref?.();
+
+	if (signal?.aborted) {
+		abort();
+	} else {
+		signal?.addEventListener("abort", abort, { once: true });
+	}
+
+	return {
+		signal: controller.signal,
+		cleanup() {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+		},
+	};
+}
+
+async function fetchWithTimedBody<T>(
+	url: string,
+	init: RequestInit = {},
+	signal: AbortSignal | undefined,
+	timeoutMs: number,
+	consume: (response: Response) => Promise<T>,
+): Promise<T> {
+	const timeout = createTimeoutSignal(signal, timeoutMs);
+	try {
+		const response = await fetch(url, { ...init, signal: timeout.signal });
+		return await consume(response);
+	} finally {
+		timeout.cleanup();
+	}
+}
+
 async function postJson(
 	config: NineRouterWebConfig,
 	path: string,
 	body: Record<string, unknown>,
 	signal?: AbortSignal,
 ): Promise<unknown> {
-	const response = await fetch(`${config.baseUrl}${path}`, {
-		method: "POST",
-		headers: authHeaders(config),
-		body: JSON.stringify(body),
+	return await fetchWithTimedBody(
+		`${config.baseUrl}${path}`,
+		{
+			method: "POST",
+			headers: authHeaders(config),
+			body: JSON.stringify(body),
+		},
 		signal,
-	});
-
-	const payload = await parseJsonResponse(response);
-	if (!response.ok) {
-		const message = typeof payload === "object" && payload && "error" in payload
-			? JSON.stringify((payload as { error: unknown }).error)
-			: JSON.stringify(payload);
-		throw new Error(`9router ${path} returned ${response.status}: ${message}`);
-	}
-	return payload;
+		REQUEST_TIMEOUT_MS,
+		async (response) => {
+			const payload = await parseJsonResponse(response);
+			if (!response.ok) {
+				const message = typeof payload === "object" && payload && "error" in payload
+					? JSON.stringify((payload as { error: unknown }).error)
+					: JSON.stringify(payload);
+				throw new Error(`9router ${path} returned ${response.status}: ${message}`);
+			}
+			return payload;
+		},
+	);
 }
 
 export async function fetchWebRoutes(
 	config: NineRouterWebConfig,
 	signal?: AbortSignal,
+	timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<NineRouterWebRoute[]> {
-	const response = await fetch(`${config.baseUrl}/v1/models/web`, {
-		method: "GET",
-		headers: authHeaders(config),
+	return await fetchWithTimedBody(
+		`${config.baseUrl}/v1/models/web`,
+		{
+			method: "GET",
+			headers: authHeaders(config),
+		},
 		signal,
-	});
+		timeoutMs,
+		async (response) => {
+			const payload = await parseJsonResponse(response);
+			if (!response.ok) {
+				throw new Error(`9router /v1/models/web returned ${response.status}: ${JSON.stringify(payload)}`);
+			}
 
-	const payload = await parseJsonResponse(response);
-	if (!response.ok) {
-		throw new Error(`9router /v1/models/web returned ${response.status}: ${JSON.stringify(payload)}`);
-	}
-
-	const data = (payload as NineRouterWebRoutesResponse).data || [];
-	return data.filter((route) => route.kind === "webSearch" || route.kind === "webFetch");
+			const data = (payload as NineRouterWebRoutesResponse).data || [];
+			return data.filter((route) => route.kind === "webSearch" || route.kind === "webFetch");
+		},
+	);
 }
 
 export function routesByKind(routes: NineRouterWebRoute[], kind: NineRouterWebKind): NineRouterWebRoute[] {

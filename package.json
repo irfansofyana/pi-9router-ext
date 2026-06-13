@@ -1,6 +1,6 @@
 {
   "name": "pi-9router-ext",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Pi Coding Agent extension for 9router — connect to your 9router AI routing proxy instance",
   "keywords": [
     "pi-package",
