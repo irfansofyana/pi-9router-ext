@@ -269,6 +269,22 @@ async function fetchWithTimeout(
 	}
 }
 
+async function fetchWithTimedBody<T>(
+	url: string,
+	init: RequestInit = {},
+	signal: AbortSignal | undefined,
+	timeoutMs: number,
+	consume: (response: Response) => Promise<T>,
+): Promise<T> {
+	const timeout = createTimeoutSignal(signal, timeoutMs);
+	try {
+		const response = await fetch(url, { ...init, signal: timeout.signal });
+		return await consume(response);
+	} finally {
+		timeout.cleanup();
+	}
+}
+
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
@@ -398,14 +414,16 @@ async function fetchModelMetadataIndex(signal?: AbortSignal, timeoutMs = REQUEST
 	}
 
 	try {
-		const response = await fetchWithTimeout(
+		const payload = await fetchWithTimedBody(
 			MODEL_METADATA_URL,
 			{ method: "GET", headers: { Accept: "application/json" } },
 			signal,
 			timeoutMs,
+			async (response) => {
+				if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+				return (await response.json()) as ModelMetadataApi;
+			},
 		);
-		if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-		const payload = (await response.json()) as ModelMetadataApi;
 		writeMetadataCache(payload);
 		return buildModelMetadataIndex(payload);
 	} catch (err) {
@@ -434,20 +452,26 @@ async function fetchModels(
 		headers.Authorization = `Bearer ${config.apiKey}`;
 	}
 
-	const response = await fetchWithTimeout(`${config.baseUrl}/v1/models`, {
-		method: "GET",
-		headers,
-	}, signal, timeoutMs);
+	return await fetchWithTimedBody(
+		`${config.baseUrl}/v1/models`,
+		{
+			method: "GET",
+			headers,
+		},
+		signal,
+		timeoutMs,
+		async (response) => {
+			if (!response.ok) {
+				const text = await response.text().catch(() => "");
+				throw new Error(
+					`9router returned ${response.status}: ${text || response.statusText}`,
+				);
+			}
 
-	if (!response.ok) {
-		const text = await response.text().catch(() => "");
-		throw new Error(
-			`9router returned ${response.status}: ${text || response.statusText}`,
-		);
-	}
-
-	const payload = (await response.json()) as NineRouterModelsResponse;
-	return payload.data || [];
+			const payload = (await response.json()) as NineRouterModelsResponse;
+			return payload.data || [];
+		},
+	);
 }
 
 async function testConnection(

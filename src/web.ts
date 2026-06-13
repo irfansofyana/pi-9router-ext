@@ -103,15 +103,17 @@ function createTimeoutSignal(signal: AbortSignal | undefined, timeoutMs: number)
 	};
 }
 
-async function fetchWithTimeout(
+async function fetchWithTimedBody<T>(
 	url: string,
 	init: RequestInit = {},
-	signal?: AbortSignal,
-	timeoutMs = REQUEST_TIMEOUT_MS,
-): Promise<Response> {
+	signal: AbortSignal | undefined,
+	timeoutMs: number,
+	consume: (response: Response) => Promise<T>,
+): Promise<T> {
 	const timeout = createTimeoutSignal(signal, timeoutMs);
 	try {
-		return await fetch(url, { ...init, signal: timeout.signal });
+		const response = await fetch(url, { ...init, signal: timeout.signal });
+		return await consume(response);
 	} finally {
 		timeout.cleanup();
 	}
@@ -123,20 +125,26 @@ async function postJson(
 	body: Record<string, unknown>,
 	signal?: AbortSignal,
 ): Promise<unknown> {
-	const response = await fetchWithTimeout(`${config.baseUrl}${path}`, {
-		method: "POST",
-		headers: authHeaders(config),
-		body: JSON.stringify(body),
-	}, signal);
-
-	const payload = await parseJsonResponse(response);
-	if (!response.ok) {
-		const message = typeof payload === "object" && payload && "error" in payload
-			? JSON.stringify((payload as { error: unknown }).error)
-			: JSON.stringify(payload);
-		throw new Error(`9router ${path} returned ${response.status}: ${message}`);
-	}
-	return payload;
+	return await fetchWithTimedBody(
+		`${config.baseUrl}${path}`,
+		{
+			method: "POST",
+			headers: authHeaders(config),
+			body: JSON.stringify(body),
+		},
+		signal,
+		REQUEST_TIMEOUT_MS,
+		async (response) => {
+			const payload = await parseJsonResponse(response);
+			if (!response.ok) {
+				const message = typeof payload === "object" && payload && "error" in payload
+					? JSON.stringify((payload as { error: unknown }).error)
+					: JSON.stringify(payload);
+				throw new Error(`9router ${path} returned ${response.status}: ${message}`);
+			}
+			return payload;
+		},
+	);
 }
 
 export async function fetchWebRoutes(
@@ -144,18 +152,24 @@ export async function fetchWebRoutes(
 	signal?: AbortSignal,
 	timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<NineRouterWebRoute[]> {
-	const response = await fetchWithTimeout(`${config.baseUrl}/v1/models/web`, {
-		method: "GET",
-		headers: authHeaders(config),
-	}, signal, timeoutMs);
+	return await fetchWithTimedBody(
+		`${config.baseUrl}/v1/models/web`,
+		{
+			method: "GET",
+			headers: authHeaders(config),
+		},
+		signal,
+		timeoutMs,
+		async (response) => {
+			const payload = await parseJsonResponse(response);
+			if (!response.ok) {
+				throw new Error(`9router /v1/models/web returned ${response.status}: ${JSON.stringify(payload)}`);
+			}
 
-	const payload = await parseJsonResponse(response);
-	if (!response.ok) {
-		throw new Error(`9router /v1/models/web returned ${response.status}: ${JSON.stringify(payload)}`);
-	}
-
-	const data = (payload as NineRouterWebRoutesResponse).data || [];
-	return data.filter((route) => route.kind === "webSearch" || route.kind === "webFetch");
+			const data = (payload as NineRouterWebRoutesResponse).data || [];
+			return data.filter((route) => route.kind === "webSearch" || route.kind === "webFetch");
+		},
+	);
 }
 
 export function routesByKind(routes: NineRouterWebRoute[], kind: NineRouterWebKind): NineRouterWebRoute[] {
