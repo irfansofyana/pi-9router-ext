@@ -47,12 +47,44 @@ interface NineRouterModel {
 	object: string;
 	owned_by?: string;
 	kind?: string;
+	contextWindow?: unknown;
+	context_window?: unknown;
+	contextLength?: unknown;
+	context_length?: unknown;
+	maxTokens?: unknown;
+	max_tokens?: unknown;
+	maxOutputTokens?: unknown;
+	max_output_tokens?: unknown;
+	maxCompletionTokens?: unknown;
+	max_completion_tokens?: unknown;
+	maxInputTokens?: unknown;
+	max_input_tokens?: unknown;
+	maxModelLen?: unknown;
+	max_model_len?: unknown;
+	metadata?: Record<string, unknown>;
+	limits?: Record<string, unknown>;
+	capabilities?: Record<string, unknown>;
+	top_provider?: Record<string, unknown>;
+	[key: string]: unknown;
 }
 
 interface NineRouterModelsResponse {
 	object: string;
 	data: NineRouterModel[];
 }
+
+interface ModelMetadata {
+	id: string;
+	name?: string;
+	reasoning?: unknown;
+	modalities?: { input?: unknown; output?: unknown };
+	limit?: { context?: unknown; output?: unknown };
+	cost?: Record<string, unknown>;
+	[key: string]: unknown;
+}
+
+type ModelMetadataApi = Record<string, { models?: Record<string, ModelMetadata> }>;
+type ModelMetadataIndex = Map<string, ModelMetadata>;
 
 // =============================================================================
 // Constants
@@ -63,9 +95,16 @@ const ENV_BASE_URL = process.env.NINE_ROUTER_BASE_URL;
 const ENV_API_KEY = process.env.NINE_ROUTER_API_KEY;
 const ENV_ENABLE_REASONING = process.env.NINE_ROUTER_ENABLE_REASONING;
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "9router-config.json");
+const CACHE_DIR = join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "pi");
+const MODEL_METADATA_CACHE_PATH = join(CACHE_DIR, "9router-model-metadata.json");
+const MODEL_METADATA_URL = "https://models.dev/api.json";
+const MODEL_METADATA_TTL_MS = 24 * 60 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 const CUSTOM_TYPE_CONFIG = "9router-config";
 const CUSTOM_TYPE_LAST_ROUTE = "9router-last-route";
+const FALLBACK_CONTEXT_WINDOW = 128000;
+const FALLBACK_MAX_TOKENS = 16384;
 
 // Headers that may indicate the actual upstream model used
 const ROUTING_HEADERS = [
@@ -190,6 +229,145 @@ function persistConfig(pi: ExtensionAPI, config: NineRouterConfig) {
 }
 
 // =============================================================================
+// Fetch Helpers
+// =============================================================================
+
+function createTimeoutSignal(signal: AbortSignal | undefined, timeoutMs: number) {
+	const controller = new AbortController();
+	const abort = () => controller.abort();
+	const timer = setTimeout(abort, timeoutMs);
+
+	if (signal?.aborted) {
+		abort();
+	} else {
+		signal?.addEventListener("abort", abort, { once: true });
+	}
+
+	return {
+		signal: controller.signal,
+		cleanup() {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+		},
+	};
+}
+
+async function fetchWithTimeout(
+	url: string,
+	init: RequestInit = {},
+	signal?: AbortSignal,
+	timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<Response> {
+	const timeout = createTimeoutSignal(signal, timeoutMs);
+	try {
+		return await fetch(url, { ...init, signal: timeout.signal });
+	} finally {
+		timeout.cleanup();
+	}
+}
+
+// =============================================================================
+// Model Metadata
+// =============================================================================
+
+function readMetadataCache(): { ts: number; data: unknown } | undefined {
+	try {
+		if (!existsSync(MODEL_METADATA_CACHE_PATH)) return undefined;
+		const cache = JSON.parse(readFileSync(MODEL_METADATA_CACHE_PATH, "utf8")) as { ts?: unknown; data?: unknown };
+		if (typeof cache.ts !== "number") return undefined;
+		return { ts: cache.ts, data: cache.data };
+	} catch {
+		return undefined;
+	}
+}
+
+function writeMetadataCache(data: unknown) {
+	try {
+		mkdirSync(dirname(MODEL_METADATA_CACHE_PATH), { recursive: true });
+		writeFileSync(MODEL_METADATA_CACHE_PATH, JSON.stringify({ ts: Date.now(), data }), { mode: 0o600 });
+	} catch (err) {
+		console.error("[pi-9router-ext] Failed to persist model metadata cache:", err);
+	}
+}
+
+function normalizeModelId(id: string): string {
+	return id
+		.toLowerCase()
+		.replace(/[:@].*$/, "")
+		.replace(/-\d{8}$/, "");
+}
+
+function stripModelPrefix(id: string): string {
+	const slash = id.lastIndexOf("/");
+	return slash >= 0 ? id.slice(slash + 1) : id;
+}
+
+function addMetadataIndexEntry(index: ModelMetadataIndex, key: string, model: ModelMetadata) {
+	if (!key) return;
+	if (!index.has(key)) index.set(key, model);
+	const normalized = normalizeModelId(key);
+	if (!index.has(normalized)) index.set(normalized, model);
+}
+
+function buildModelMetadataIndex(api: ModelMetadataApi): ModelMetadataIndex {
+	const index: ModelMetadataIndex = new Map();
+	for (const provider of Object.values(api)) {
+		if (!provider?.models) continue;
+		for (const [modelId, model] of Object.entries(provider.models)) {
+			const indexedModel = { ...model, id: model.id || modelId };
+			addMetadataIndexEntry(index, modelId, indexedModel);
+			addMetadataIndexEntry(index, indexedModel.id, indexedModel);
+			addMetadataIndexEntry(index, stripModelPrefix(modelId), indexedModel);
+			addMetadataIndexEntry(index, stripModelPrefix(indexedModel.id), indexedModel);
+		}
+	}
+	return index;
+}
+
+function lookupModelMetadata(id: string, index: ModelMetadataIndex): ModelMetadata | undefined {
+	const candidates = [id, stripModelPrefix(id), normalizeModelId(id), normalizeModelId(stripModelPrefix(id))];
+	for (const candidate of candidates) {
+		const match = index.get(candidate);
+		if (match) return match;
+	}
+
+	const normalized = normalizeModelId(stripModelPrefix(id));
+	for (const [key, model] of index) {
+		const normalizedKey = normalizeModelId(key);
+		if (normalizedKey.startsWith(normalized) || normalized.startsWith(normalizedKey)) {
+			return model;
+		}
+	}
+	return undefined;
+}
+
+async function fetchModelMetadataIndex(signal?: AbortSignal): Promise<ModelMetadataIndex> {
+	const cached = readMetadataCache();
+	if (cached && Date.now() - cached.ts < MODEL_METADATA_TTL_MS) {
+		return buildModelMetadataIndex((cached.data as ModelMetadataApi) || {});
+	}
+
+	try {
+		const response = await fetchWithTimeout(
+			MODEL_METADATA_URL,
+			{ method: "GET", headers: { Accept: "application/json" } },
+			signal,
+		);
+		if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+		const payload = (await response.json()) as ModelMetadataApi;
+		writeMetadataCache(payload);
+		return buildModelMetadataIndex(payload);
+	} catch (err) {
+		if (cached) {
+			console.error("[pi-9router-ext] Failed to refresh model metadata, using stale cache:", err);
+			return buildModelMetadataIndex((cached.data as ModelMetadataApi) || {});
+		}
+		console.error("[pi-9router-ext] Failed to fetch model metadata:", err);
+		return new Map();
+	}
+}
+
+// =============================================================================
 // 9router API Client
 // =============================================================================
 
@@ -204,11 +382,10 @@ async function fetchModels(
 		headers.Authorization = `Bearer ${config.apiKey}`;
 	}
 
-	const response = await fetch(`${config.baseUrl}/v1/models`, {
+	const response = await fetchWithTimeout(`${config.baseUrl}/v1/models`, {
 		method: "GET",
 		headers,
-		signal,
-	});
+	}, signal);
 
 	if (!response.ok) {
 		const text = await response.text().catch(() => "");
@@ -231,11 +408,10 @@ async function testConnection(
 			headers.Authorization = `Bearer ${config.apiKey}`;
 		}
 
-		const response = await fetch(`${config.baseUrl}/v1/models`, {
+		const response = await fetchWithTimeout(`${config.baseUrl}/v1/models`, {
 			method: "GET",
 			headers,
-			signal,
-		});
+		}, signal);
 
 		if (response.ok) {
 			return { ok: true };
@@ -250,8 +426,208 @@ async function testConnection(
 // Model Mapping
 // =============================================================================
 
-function mapNineRouterModel(model: NineRouterModel, enableReasoning: boolean) {
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseTokenCount(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+		return Math.floor(value);
+	}
+	if (typeof value !== "string") return undefined;
+
+	const normalized = value.trim().replace(/,/g, "").toLowerCase();
+	const match = normalized.match(/^(\d+(?:\.\d+)?)([km])?$/);
+	if (!match) return undefined;
+
+	const amount = Number(match[1]);
+	if (!Number.isFinite(amount) || amount <= 0) return undefined;
+	const multiplier = match[2] === "m" ? 1_000_000 : match[2] === "k" ? 1_000 : 1;
+	return Math.floor(amount * multiplier);
+}
+
+function readPath(record: Record<string, unknown>, path: readonly string[]): unknown {
+	let current: unknown = record;
+	for (const segment of path) {
+		if (!isRecord(current)) return undefined;
+		current = current[segment];
+	}
+	return current;
+}
+
+function firstTokenCount(record: Record<string, unknown>, paths: readonly (readonly string[])[]): number | undefined {
+	for (const path of paths) {
+		const value = readPath(record, path);
+		const parsed = parseTokenCount(value);
+		if (parsed !== undefined) return parsed;
+	}
+	return undefined;
+}
+
+type LimitSource = "router" | "metadata" | "fallback";
+
+interface LimitInfo {
+	value: number;
+	source: LimitSource;
+}
+
+const ROUTER_CONTEXT_PATHS = [
+	["contextWindow"],
+	["context_window"],
+	["contextLength"],
+	["context_length"],
+	["maxContextWindow"],
+	["max_context_window"],
+	["maxContextLength"],
+	["max_context_length"],
+	["maxInputTokens"],
+	["max_input_tokens"],
+	["maxModelLen"],
+	["max_model_len"],
+	["inputTokenLimit"],
+	["input_token_limit"],
+	["totalTokenLimit"],
+	["total_token_limit"],
+	["tokenLimit"],
+	["token_limit"],
+	["n_ctx"],
+	["ctx_size"],
+	["top_provider", "context_length"],
+	["metadata", "contextWindow"],
+	["metadata", "context_window"],
+	["metadata", "context_length"],
+	["metadata", "maxInputTokens"],
+	["metadata", "max_input_tokens"],
+	["metadata", "maxModelLen"],
+	["metadata", "max_model_len"],
+	["limits", "contextWindow"],
+	["limits", "context_window"],
+	["limits", "context_length"],
+	["limits", "maxInputTokens"],
+	["limits", "max_input_tokens"],
+	["limits", "maxModelLen"],
+	["limits", "max_model_len"],
+	["capabilities", "contextWindow"],
+	["capabilities", "context_window"],
+	["capabilities", "context_length"],
+	["capabilities", "maxInputTokens"],
+	["capabilities", "max_input_tokens"],
+	["capabilities", "maxModelLen"],
+	["capabilities", "max_model_len"],
+] as const;
+
+const ROUTER_OUTPUT_PATHS = [
+	["maxOutputTokens"],
+	["max_output_tokens"],
+	["maxCompletionTokens"],
+	["max_completion_tokens"],
+	["outputTokenLimit"],
+	["output_token_limit"],
+	["maxNewTokens"],
+	["max_new_tokens"],
+	["n_predict"],
+	["top_provider", "max_completion_tokens"],
+	["metadata", "maxOutputTokens"],
+	["metadata", "max_output_tokens"],
+	["metadata", "maxCompletionTokens"],
+	["metadata", "max_completion_tokens"],
+	["metadata", "maxNewTokens"],
+	["metadata", "max_new_tokens"],
+	["limits", "maxOutputTokens"],
+	["limits", "max_output_tokens"],
+	["limits", "maxCompletionTokens"],
+	["limits", "max_completion_tokens"],
+	["limits", "maxNewTokens"],
+	["limits", "max_new_tokens"],
+	["capabilities", "maxOutputTokens"],
+	["capabilities", "max_output_tokens"],
+	["capabilities", "maxCompletionTokens"],
+	["capabilities", "max_completion_tokens"],
+	["capabilities", "maxNewTokens"],
+	["capabilities", "max_new_tokens"],
+	["maxTokens"],
+	["max_tokens"],
+	["metadata", "maxTokens"],
+	["metadata", "max_tokens"],
+	["limits", "maxTokens"],
+	["limits", "max_tokens"],
+	["capabilities", "maxTokens"],
+	["capabilities", "max_tokens"],
+] as const;
+
+const METADATA_CONTEXT_PATHS = [
+	["limit", "context"],
+	["limits", "context"],
+	["contextWindow"],
+	["context_window"],
+	["contextLength"],
+	["context_length"],
+	["maxInputTokens"],
+	["max_input_tokens"],
+] as const;
+
+const METADATA_OUTPUT_PATHS = [
+	["limit", "output"],
+	["limits", "output"],
+	["maxOutputTokens"],
+	["max_output_tokens"],
+	["maxCompletionTokens"],
+	["max_completion_tokens"],
+	["maxTokens"],
+	["max_tokens"],
+] as const;
+
+function modelContextWindowInfo(model: NineRouterModel, metadata?: ModelMetadata): LimitInfo {
+	const routerValue = firstTokenCount(model, ROUTER_CONTEXT_PATHS);
+	if (routerValue !== undefined) return { value: routerValue, source: "router" };
+
+	const metadataValue = metadata ? firstTokenCount(metadata, METADATA_CONTEXT_PATHS) : undefined;
+	if (metadataValue !== undefined) return { value: metadataValue, source: "metadata" };
+
+	return { value: FALLBACK_CONTEXT_WINDOW, source: "fallback" };
+}
+
+function modelMaxTokensInfo(model: NineRouterModel, metadata: ModelMetadata | undefined, contextWindow: number): LimitInfo {
+	const routerValue = firstTokenCount(model, ROUTER_OUTPUT_PATHS);
+	if (routerValue !== undefined) return { value: Math.min(routerValue, contextWindow), source: "router" };
+
+	const metadataValue = metadata ? firstTokenCount(metadata, METADATA_OUTPUT_PATHS) : undefined;
+	if (metadataValue !== undefined) return { value: Math.min(metadataValue, contextWindow), source: "metadata" };
+
+	return { value: Math.min(FALLBACK_MAX_TOKENS, contextWindow), source: "fallback" };
+}
+
+function modelContextWindow(model: NineRouterModel, metadata?: ModelMetadata): number {
+	return modelContextWindowInfo(model, metadata).value;
+}
+
+function modelMaxTokens(model: NineRouterModel, metadata?: ModelMetadata, contextWindow = modelContextWindow(model, metadata)): number {
+	return modelMaxTokensInfo(model, metadata, contextWindow).value;
+}
+
+function modelInputTypes(metadata?: ModelMetadata): ("text" | "image")[] {
+	const input = metadata?.modalities?.input;
+	if (Array.isArray(input)) {
+		const types = input.filter((item): item is "text" | "image" => item === "text" || item === "image");
+		if (types.length > 0) return types;
+	}
+	return ["text"];
+}
+
+function formatTokenCount(tokens: number): string {
+	return tokens >= 1000 && tokens % 1000 === 0 ? `${tokens / 1000}k` : String(tokens);
+}
+
+function modelLimitSummary(model: NineRouterModel, metadata?: ModelMetadata): string {
+	const context = modelContextWindowInfo(model, metadata);
+	const output = modelMaxTokensInfo(model, metadata, context.value);
+	return `${formatTokenCount(context.value)} ctx / ${formatTokenCount(output.value)} out (${context.source}/${output.source})`;
+}
+
+function mapNineRouterModel(model: NineRouterModel, enableReasoning: boolean, metadata?: ModelMetadata) {
 	const isCombo = model.owned_by === "combo";
+	const contextWindow = modelContextWindow(model, metadata);
+	const maxTokens = modelMaxTokens(model, metadata, contextWindow);
 
 	return {
 		id: model.id,
@@ -270,10 +646,10 @@ function mapNineRouterModel(model: NineRouterModel, enableReasoning: boolean) {
 				xhigh: "xhigh",
 			},
 		} : {}),
-		input: ["text"] as ("text" | "image")[],
+		input: modelInputTypes(metadata),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128000,
-		maxTokens: 4096,
+		contextWindow,
+		maxTokens,
 		compat: {
 			// 9router is an OpenAI-compatible proxy. Its translators primarily read
 			// max_tokens, and as a proxy it should not receive OpenAI-only store=false
@@ -295,6 +671,7 @@ function registerNineRouterProvider(
 	pi: ExtensionAPI,
 	config: NineRouterConfig,
 	models: NineRouterModel[],
+	metadataIndex: ModelMetadataIndex,
 ) {
 	// Always use a dedicated provider id ("9router") and never override built-in
 	// providers like ollama-cloud/openrouter. Pi requires apiKey for custom
@@ -305,7 +682,11 @@ function registerNineRouterProvider(
 		baseUrl: `${config.baseUrl}/v1`,
 		apiKey: config.apiKey || "9router-no-api-key",
 		api: "openai-completions",
-		models: models.map((model) => mapNineRouterModel(model, config.enableReasoning)),
+		models: models.map((model) => mapNineRouterModel(
+			model,
+			config.enableReasoning,
+			lookupModelMetadata(model.id, metadataIndex),
+		)),
 	});
 }
 
@@ -325,6 +706,7 @@ export default async function (pi: ExtensionAPI) {
 
 	// State that survives across the extension lifetime
 	let discoveredModels: NineRouterModel[] = [];
+	let modelMetadataIndex: ModelMetadataIndex = new Map();
 	let discoveredWebRoutes: NineRouterWebRoute[] = [];
 	let lastRoutedModel: string | undefined;
 	let activeProvider: string | undefined;
@@ -334,6 +716,18 @@ export default async function (pi: ExtensionAPI) {
 		const routes = await fetchWebRoutes(config, signal);
 		discoveredWebRoutes = routes;
 		return routes;
+	}
+
+	async function refreshModels(signal?: AbortSignal): Promise<NineRouterModel[]> {
+		const [models, metadataIndex] = await Promise.all([
+			fetchModels(config, signal),
+			fetchModelMetadataIndex(signal),
+		]);
+		discoveredModels = models;
+		modelMetadataIndex = metadataIndex;
+		isConnected = true;
+		registerNineRouterProvider(pi, config, models, metadataIndex);
+		return models;
 	}
 
 	registerNineRouterWebTools(
@@ -346,10 +740,7 @@ export default async function (pi: ExtensionAPI) {
 	// Provider registration (async factory = models available immediately)
 	// ---------------------------------------------------------------------------
 	try {
-		const models = await fetchModels(config);
-		discoveredModels = models;
-		isConnected = true;
-		registerNineRouterProvider(pi, config, models);
+		await refreshModels();
 	} catch (err) {
 		console.error(
 			"[pi-9router-ext] Failed to discover models from 9router:",
@@ -377,10 +768,7 @@ export default async function (pi: ExtensionAPI) {
 			config = restored;
 			persistConfig(pi, config);
 			try {
-				const models = await fetchModels(config, ctx.signal);
-				discoveredModels = models;
-				isConnected = true;
-				registerNineRouterProvider(pi, config, models);
+				await refreshModels(ctx.signal);
 				await refreshWebRoutes(ctx.signal).catch((err) => {
 					console.error("[pi-9router-ext] Failed to refresh migrated web routes:", err);
 				});
@@ -449,6 +837,7 @@ export default async function (pi: ExtensionAPI) {
 				`Reasoning:   ${config.enableReasoning ? "enabled (manual)" : "disabled"}`,
 				`Connection:  ${test.ok ? "🟢 connected" : `🔴 ${test.error || "disconnected"}`}`,
 				`Models:      ${discoveredModels.length} available`,
+				`Metadata:    ${modelMetadataIndex.size > 0 ? `${modelMetadataIndex.size} index keys cached` : "unavailable"}`,
 				...webRoutesSummary(discoveredWebRoutes, config),
 			];
 
@@ -485,9 +874,10 @@ export default async function (pi: ExtensionAPI) {
 
 			const items = discoveredModels.map((m) => {
 				const isCombo = m.owned_by === "combo";
+				const metadata = lookupModelMetadata(m.id, modelMetadataIndex);
 				return {
 					value: m.id,
-					label: isCombo ? `🔀 ${m.id}` : m.id,
+					label: `${isCombo ? `🔀 ${m.id}` : m.id} (${modelLimitSummary(m, metadata)})`,
 				};
 			});
 
@@ -556,10 +946,7 @@ export default async function (pi: ExtensionAPI) {
 					persistConfig(pi, config);
 
 					try {
-						const models = await fetchModels(config, ctx.signal);
-						discoveredModels = models;
-						isConnected = true;
-						registerNineRouterProvider(pi, config, models);
+						const models = await refreshModels(ctx.signal);
 						await refreshWebRoutes(ctx.signal).catch((err) => {
 							console.error("[pi-9router-ext] Failed to refresh web routes:", err);
 						});
@@ -584,7 +971,7 @@ export default async function (pi: ExtensionAPI) {
 					};
 					persistConfig(pi, config);
 					if (discoveredModels.length > 0) {
-						registerNineRouterProvider(pi, config, discoveredModels);
+						registerNineRouterProvider(pi, config, discoveredModels, modelMetadataIndex);
 					}
 					ctx.ui.notify(`9router reasoning ${config.enableReasoning ? "enabled" : "disabled"}`, "info");
 				}
@@ -647,6 +1034,7 @@ export default async function (pi: ExtensionAPI) {
 						`Reasoning:   ${config.enableReasoning ? "enabled" : "disabled"}`,
 						`Connection:  ${test.ok ? "🟢 connected" : `🔴 ${test.error || "disconnected"}`}`,
 						`Models:      ${discoveredModels.length} available`,
+						`Metadata:    ${modelMetadataIndex.size > 0 ? `${modelMetadataIndex.size} index keys cached` : "unavailable"}`,
 						...webRoutesSummary(discoveredWebRoutes, config),
 						"",
 						"Web search routes:",
@@ -682,7 +1070,7 @@ export default async function (pi: ExtensionAPI) {
 			persistConfig(pi, config);
 
 			if (discoveredModels.length > 0) {
-				registerNineRouterProvider(pi, config, discoveredModels);
+				registerNineRouterProvider(pi, config, discoveredModels, modelMetadataIndex);
 			}
 
 			ctx.ui.notify(
@@ -701,11 +1089,8 @@ export default async function (pi: ExtensionAPI) {
 		description: "Reload models from 9router",
 		handler: async (_args, ctx) => {
 			try {
-				const models = await fetchModels(config, ctx.signal);
-				discoveredModels = models;
-				isConnected = true;
+				const models = await refreshModels(ctx.signal);
 
-				registerNineRouterProvider(pi, config, models);
 				await refreshWebRoutes(ctx.signal).catch((err) => {
 					console.error("[pi-9router-ext] Failed to reload web routes:", err);
 				});
@@ -748,6 +1133,7 @@ export default async function (pi: ExtensionAPI) {
 							`Total models: ${discoveredModels.length}`,
 							`  Regular: ${regular.length}`,
 							`  Combos:  ${combos.length}`,
+							`Metadata: ${modelMetadataIndex.size > 0 ? `${modelMetadataIndex.size} index keys cached` : "unavailable"}`,
 							...webRoutesSummary(discoveredWebRoutes, config),
 							lastRoutedModel
 								? `Last routed model: ${lastRoutedModel}`
@@ -764,6 +1150,19 @@ export default async function (pi: ExtensionAPI) {
 					modelCount: discoveredModels.length,
 					regularCount: regular.length,
 					comboCount: combos.length,
+					metadataIndexSize: modelMetadataIndex.size,
+					modelLimits: discoveredModels.map((model) => {
+						const metadata = lookupModelMetadata(model.id, modelMetadataIndex);
+						const context = modelContextWindowInfo(model, metadata);
+						const output = modelMaxTokensInfo(model, metadata, context.value);
+						return {
+							id: model.id,
+							contextWindow: context.value,
+							contextWindowSource: context.source,
+							maxTokens: output.value,
+							maxTokensSource: output.source,
+						};
+					}),
 					webSearchRoutes: routesByKind(discoveredWebRoutes, "webSearch").map((route) => route.id),
 					webFetchRoutes: routesByKind(discoveredWebRoutes, "webFetch").map((route) => route.id),
 					webSearchRoute: config.webSearchRoute,
