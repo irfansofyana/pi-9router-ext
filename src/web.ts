@@ -86,6 +86,7 @@ function createTimeoutSignal(signal: AbortSignal | undefined, timeoutMs: number)
 	const controller = new AbortController();
 	const abort = () => controller.abort();
 	const timer = setTimeout(abort, timeoutMs);
+	timer.unref?.();
 
 	if (signal?.aborted) {
 		abort();
@@ -141,11 +142,12 @@ async function postJson(
 export async function fetchWebRoutes(
 	config: NineRouterWebConfig,
 	signal?: AbortSignal,
+	timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<NineRouterWebRoute[]> {
 	const response = await fetchWithTimeout(`${config.baseUrl}/v1/models/web`, {
 		method: "GET",
 		headers: authHeaders(config),
-	}, signal);
+	}, signal, timeoutMs);
 
 	const payload = await parseJsonResponse(response);
 	if (!response.ok) {

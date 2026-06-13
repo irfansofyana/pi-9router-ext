@@ -85,6 +85,7 @@ interface ModelMetadata {
 
 type ModelMetadataApi = Record<string, { models?: Record<string, ModelMetadata> }>;
 type ModelMetadataIndex = Map<string, ModelMetadata>;
+type DiscoveryStatus = "idle" | "discovering" | "connected" | "not_configured" | "disconnected";
 
 // =============================================================================
 // Constants
@@ -100,6 +101,7 @@ const MODEL_METADATA_CACHE_PATH = join(CACHE_DIR, "9router-model-metadata.json")
 const MODEL_METADATA_URL = "https://models.dev/api.json";
 const MODEL_METADATA_TTL_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const STARTUP_DISCOVERY_TIMEOUT_MS = 5_000;
 
 const CUSTOM_TYPE_CONFIG = "9router-config";
 const CUSTOM_TYPE_LAST_ROUTE = "9router-last-route";
@@ -236,6 +238,7 @@ function createTimeoutSignal(signal: AbortSignal | undefined, timeoutMs: number)
 	const controller = new AbortController();
 	const abort = () => controller.abort();
 	const timer = setTimeout(abort, timeoutMs);
+	timer.unref?.();
 
 	if (signal?.aborted) {
 		abort();
@@ -264,6 +267,30 @@ async function fetchWithTimeout(
 	} finally {
 		timeout.cleanup();
 	}
+}
+
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+function isAuthError(err: unknown): boolean {
+	const message = errorMessage(err).toLowerCase();
+	return message.includes("401")
+		|| message.includes("403")
+		|| message.includes("unauthorized")
+		|| message.includes("forbidden")
+		|| message.includes("api key")
+		|| message.includes("auth");
+}
+
+function connectionFailureStatus(err: unknown): DiscoveryStatus {
+	return isAuthError(err) ? "not_configured" : "disconnected";
+}
+
+function conciseConnectionMessage(err: unknown): string {
+	const message = errorMessage(err);
+	if (isAuthError(err)) return `auth required (${message})`;
+	return message;
 }
 
 // =============================================================================
@@ -341,7 +368,7 @@ function lookupModelMetadata(id: string, index: ModelMetadataIndex): ModelMetada
 	return undefined;
 }
 
-async function fetchModelMetadataIndex(signal?: AbortSignal): Promise<ModelMetadataIndex> {
+async function fetchModelMetadataIndex(signal?: AbortSignal, timeoutMs = REQUEST_TIMEOUT_MS): Promise<ModelMetadataIndex> {
 	const cached = readMetadataCache();
 	if (cached && Date.now() - cached.ts < MODEL_METADATA_TTL_MS) {
 		return buildModelMetadataIndex((cached.data as ModelMetadataApi) || {});
@@ -352,6 +379,7 @@ async function fetchModelMetadataIndex(signal?: AbortSignal): Promise<ModelMetad
 			MODEL_METADATA_URL,
 			{ method: "GET", headers: { Accept: "application/json" } },
 			signal,
+			timeoutMs,
 		);
 		if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
 		const payload = (await response.json()) as ModelMetadataApi;
@@ -359,10 +387,10 @@ async function fetchModelMetadataIndex(signal?: AbortSignal): Promise<ModelMetad
 		return buildModelMetadataIndex(payload);
 	} catch (err) {
 		if (cached) {
-			console.error("[pi-9router-ext] Failed to refresh model metadata, using stale cache:", err);
+			console.warn(`[pi-9router-ext] Failed to refresh model metadata, using stale cache: ${errorMessage(err)}`);
 			return buildModelMetadataIndex((cached.data as ModelMetadataApi) || {});
 		}
-		console.error("[pi-9router-ext] Failed to fetch model metadata:", err);
+		console.warn(`[pi-9router-ext] Failed to fetch model metadata: ${errorMessage(err)}`);
 		return new Map();
 	}
 }
@@ -374,6 +402,7 @@ async function fetchModelMetadataIndex(signal?: AbortSignal): Promise<ModelMetad
 async function fetchModels(
 	config: NineRouterConfig,
 	signal?: AbortSignal,
+	timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<NineRouterModel[]> {
 	const headers: Record<string, string> = {
 		Accept: "application/json",
@@ -385,7 +414,7 @@ async function fetchModels(
 	const response = await fetchWithTimeout(`${config.baseUrl}/v1/models`, {
 		method: "GET",
 		headers,
-	}, signal);
+	}, signal, timeoutMs);
 
 	if (!response.ok) {
 		const text = await response.text().catch(() => "");
@@ -401,6 +430,7 @@ async function fetchModels(
 async function testConnection(
 	config: NineRouterConfig,
 	signal?: AbortSignal,
+	timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<{ ok: boolean; error?: string }> {
 	try {
 		const headers: Record<string, string> = {};
@@ -411,7 +441,7 @@ async function testConnection(
 		const response = await fetchWithTimeout(`${config.baseUrl}/v1/models`, {
 			method: "GET",
 			headers,
-		}, signal);
+		}, signal, timeoutMs);
 
 		if (response.ok) {
 			return { ok: true };
@@ -711,23 +741,70 @@ export default async function (pi: ExtensionAPI) {
 	let lastRoutedModel: string | undefined;
 	let activeProvider: string | undefined;
 	let isConnected = false;
+	let discoveryStatus: DiscoveryStatus = "idle";
+	let lastDiscoveryError: string | undefined;
+	let isDiscovering = false;
 
-	async function refreshWebRoutes(signal?: AbortSignal): Promise<NineRouterWebRoute[]> {
-		const routes = await fetchWebRoutes(config, signal);
+	function markDiscoveryFailure(err: unknown, context: string) {
+		isConnected = false;
+		discoveryStatus = connectionFailureStatus(err);
+		lastDiscoveryError = conciseConnectionMessage(err);
+		unregisterNineRouterProvider(pi);
+		console.warn(`[pi-9router-ext] ${context}: ${lastDiscoveryError}`);
+	}
+
+	async function refreshWebRoutes(signal?: AbortSignal, timeoutMs = REQUEST_TIMEOUT_MS): Promise<NineRouterWebRoute[]> {
+		const routes = await fetchWebRoutes(config, signal, timeoutMs);
 		discoveredWebRoutes = routes;
 		return routes;
 	}
 
-	async function refreshModels(signal?: AbortSignal): Promise<NineRouterModel[]> {
-		const [models, metadataIndex] = await Promise.all([
-			fetchModels(config, signal),
-			fetchModelMetadataIndex(signal),
-		]);
-		discoveredModels = models;
-		modelMetadataIndex = metadataIndex;
-		isConnected = true;
-		registerNineRouterProvider(pi, config, models, metadataIndex);
-		return models;
+	async function refreshModels(signal?: AbortSignal, timeoutMs = REQUEST_TIMEOUT_MS): Promise<NineRouterModel[]> {
+		isDiscovering = true;
+		discoveryStatus = "discovering";
+		try {
+			const [models, metadataIndex] = await Promise.all([
+				fetchModels(config, signal, timeoutMs),
+				fetchModelMetadataIndex(signal, timeoutMs),
+			]);
+			if (models.length === 0) {
+				throw new Error("no models returned by /v1/models");
+			}
+			discoveredModels = models;
+			modelMetadataIndex = metadataIndex;
+			isConnected = true;
+			discoveryStatus = "connected";
+			lastDiscoveryError = undefined;
+			registerNineRouterProvider(pi, config, models, metadataIndex);
+			return models;
+		} finally {
+			isDiscovering = false;
+		}
+	}
+
+	function startBackgroundDiscovery(reason: string) {
+		void (async () => {
+			try {
+				await refreshModels(undefined, STARTUP_DISCOVERY_TIMEOUT_MS);
+			} catch (err) {
+				markDiscoveryFailure(err, `${reason} model discovery skipped`);
+				return;
+			}
+
+			try {
+				await refreshWebRoutes(undefined, STARTUP_DISCOVERY_TIMEOUT_MS);
+			} catch (err) {
+				console.warn(`[pi-9router-ext] ${reason} web route discovery skipped: ${conciseConnectionMessage(err)}`);
+			}
+		})();
+	}
+
+	function discoveryStatusLine(): string {
+		if (isDiscovering) return "discovering";
+		if (discoveryStatus === "connected") return "connected";
+		if (discoveryStatus === "not_configured") return `not configured${lastDiscoveryError ? ` — ${lastDiscoveryError}` : ""}`;
+		if (discoveryStatus === "disconnected") return `disconnected${lastDiscoveryError ? ` — ${lastDiscoveryError}` : ""}`;
+		return "idle";
 	}
 
 	registerNineRouterWebTools(
@@ -737,26 +814,10 @@ export default async function (pi: ExtensionAPI) {
 	);
 
 	// ---------------------------------------------------------------------------
-	// Provider registration (async factory = models available immediately)
+	// Provider registration happens in background so Pi remains usable even when
+	// 9router is not configured, unreachable, or slow during first install.
 	// ---------------------------------------------------------------------------
-	try {
-		await refreshModels();
-	} catch (err) {
-		console.error(
-			"[pi-9router-ext] Failed to discover models from 9router:",
-			err,
-		);
-		// Do not register an empty/broken provider on startup. Leaving the provider
-		// absent is safer for built-in Pi providers and model selection. Commands
-		// remain available so the user can configure/reload 9router later.
-		unregisterNineRouterProvider(pi);
-	}
-
-	try {
-		await refreshWebRoutes();
-	} catch (err) {
-		console.error("[pi-9router-ext] Failed to discover web routes from 9router:", err);
-	}
+	startBackgroundDiscovery("startup");
 
 	// ---------------------------------------------------------------------------
 	// Session start: rehydrate config from session
@@ -767,15 +828,7 @@ export default async function (pi: ExtensionAPI) {
 			// Migrate old session-persisted config to the new user-wide config file.
 			config = restored;
 			persistConfig(pi, config);
-			try {
-				await refreshModels(ctx.signal);
-				await refreshWebRoutes(ctx.signal).catch((err) => {
-					console.error("[pi-9router-ext] Failed to refresh migrated web routes:", err);
-				});
-			} catch (err) {
-				isConnected = false;
-				console.error("[pi-9router-ext] Failed to refresh migrated config:", err);
-			}
+			startBackgroundDiscovery("migrated config");
 		}
 
 		if (isConnected && discoveredModels.length > 0) {
@@ -783,10 +836,12 @@ export default async function (pi: ExtensionAPI) {
 				`9router connected — ${discoveredModels.length} models, ${routesByKind(discoveredWebRoutes, "webSearch").length} search routes, ${routesByKind(discoveredWebRoutes, "webFetch").length} fetch routes available`,
 				"info",
 			);
+		} else if (isDiscovering) {
+			ctx.ui.notify("9router discovery running in background", "info");
 		} else {
 			ctx.ui.notify(
-				`9router not connected — check ${config.baseUrl}`,
-				"warning",
+				`9router ${discoveryStatusLine()} — use /9router-config to configure or /9router-reload to retry`,
+				discoveryStatus === "not_configured" ? "warning" : "info",
 			);
 		}
 	});
@@ -836,6 +891,7 @@ export default async function (pi: ExtensionAPI) {
 				`API Key:     ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
 				`Reasoning:   ${config.enableReasoning ? "enabled (manual)" : "disabled"}`,
 				`Connection:  ${test.ok ? "🟢 connected" : `🔴 ${test.error || "disconnected"}`}`,
+				`Discovery:   ${discoveryStatusLine()}`,
 				`Models:      ${discoveredModels.length} available`,
 				`Metadata:    ${modelMetadataIndex.size > 0 ? `${modelMetadataIndex.size} index keys cached` : "unavailable"}`,
 				...webRoutesSummary(discoveredWebRoutes, config),
@@ -948,14 +1004,12 @@ export default async function (pi: ExtensionAPI) {
 					try {
 						const models = await refreshModels(ctx.signal);
 						await refreshWebRoutes(ctx.signal).catch((err) => {
-							console.error("[pi-9router-ext] Failed to refresh web routes:", err);
+							console.warn(`[pi-9router-ext] Failed to refresh web routes: ${conciseConnectionMessage(err)}`);
 						});
 						ctx.ui.notify(`9router connection updated — ${models.length} models`, "info");
 					} catch (err) {
-						isConnected = false;
-						unregisterNineRouterProvider(pi);
-						const msg = err instanceof Error ? err.message : String(err);
-						ctx.ui.notify(`Failed to connect: ${msg}`, "error");
+						markDiscoveryFailure(err, "connection update failed");
+						ctx.ui.notify(`Failed to connect: ${discoveryStatusLine()}`, isAuthError(err) ? "warning" : "error");
 					}
 				}
 
@@ -980,8 +1034,7 @@ export default async function (pi: ExtensionAPI) {
 					try {
 						await refreshWebRoutes(ctx.signal);
 					} catch (err) {
-						const msg = err instanceof Error ? err.message : String(err);
-						ctx.ui.notify(`Failed to refresh web routes: ${msg}`, "error");
+						ctx.ui.notify(`Failed to refresh web routes: ${conciseConnectionMessage(err)}`, isAuthError(err) ? "warning" : "error");
 						continue;
 					}
 
@@ -1033,6 +1086,7 @@ export default async function (pi: ExtensionAPI) {
 						`API Key:     ${config.apiKey ? maskApiKey(config.apiKey) : "not set"}`,
 						`Reasoning:   ${config.enableReasoning ? "enabled" : "disabled"}`,
 						`Connection:  ${test.ok ? "🟢 connected" : `🔴 ${test.error || "disconnected"}`}`,
+						`Discovery:   ${discoveryStatusLine()}`,
 						`Models:      ${discoveredModels.length} available`,
 						`Metadata:    ${modelMetadataIndex.size > 0 ? `${modelMetadataIndex.size} index keys cached` : "unavailable"}`,
 						...webRoutesSummary(discoveredWebRoutes, config),
@@ -1092,7 +1146,7 @@ export default async function (pi: ExtensionAPI) {
 				const models = await refreshModels(ctx.signal);
 
 				await refreshWebRoutes(ctx.signal).catch((err) => {
-					console.error("[pi-9router-ext] Failed to reload web routes:", err);
+					console.warn(`[pi-9router-ext] Failed to reload web routes: ${conciseConnectionMessage(err)}`);
 				});
 
 				ctx.ui.notify(
@@ -1100,10 +1154,8 @@ export default async function (pi: ExtensionAPI) {
 					"info",
 				);
 			} catch (err) {
-				isConnected = false;
-				unregisterNineRouterProvider(pi);
-				const msg = err instanceof Error ? err.message : String(err);
-				ctx.ui.notify(`Reload failed: ${msg}`, "error");
+				markDiscoveryFailure(err, "reload failed");
+				ctx.ui.notify(`Reload failed: ${discoveryStatusLine()}`, isAuthError(err) ? "warning" : "error");
 			}
 		},
 	});
@@ -1130,6 +1182,7 @@ export default async function (pi: ExtensionAPI) {
 							`9router: ${test.ok ? "connected" : `disconnected (${test.error})`}`,
 							`Base URL: ${config.baseUrl}`,
 							`Reasoning: ${config.enableReasoning ? "enabled" : "disabled"}`,
+							`Discovery: ${discoveryStatusLine()}`,
 							`Total models: ${discoveredModels.length}`,
 							`  Regular: ${regular.length}`,
 							`  Combos:  ${combos.length}`,
@@ -1145,6 +1198,9 @@ export default async function (pi: ExtensionAPI) {
 				],
 				details: {
 					connected: test.ok,
+					discoveryStatus,
+					isDiscovering,
+					lastDiscoveryError,
 					baseUrl: config.baseUrl,
 					enableReasoning: config.enableReasoning,
 					modelCount: discoveredModels.length,
