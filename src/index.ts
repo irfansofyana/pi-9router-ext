@@ -745,6 +745,7 @@ export default async function (pi: ExtensionAPI) {
 	let lastDiscoveryError: string | undefined;
 	let isDiscovering = false;
 	let discoveryGeneration = 0;
+	let webRouteGeneration = 0;
 
 	function beginDiscovery() {
 		discoveryGeneration += 1;
@@ -756,13 +757,20 @@ export default async function (pi: ExtensionAPI) {
 		};
 	}
 
+	function beginWebRouteRefresh(discoveryConfig: NineRouterConfig = config) {
+		webRouteGeneration += 1;
+		return {
+			generation: webRouteGeneration,
+			config: { ...discoveryConfig },
+		};
+	}
+
 	function isCurrentDiscovery(generation: number): boolean {
 		return generation === discoveryGeneration;
 	}
 
-	function cancelPendingDiscovery() {
-		discoveryGeneration += 1;
-		isDiscovering = false;
+	function isCurrentWebRouteRefresh(generation: number): boolean {
+		return generation === webRouteGeneration;
 	}
 
 	function finishDiscovery(generation: number) {
@@ -782,7 +790,7 @@ export default async function (pi: ExtensionAPI) {
 
 	async function refreshWebRoutes(discoveryConfig: NineRouterConfig, generation: number, signal?: AbortSignal, timeoutMs = REQUEST_TIMEOUT_MS): Promise<NineRouterWebRoute[]> {
 		const routes = await fetchWebRoutes(discoveryConfig, signal, timeoutMs);
-		if (isCurrentDiscovery(generation)) {
+		if (isCurrentWebRouteRefresh(generation)) {
 			discoveredWebRoutes = routes;
 		}
 		return routes;
@@ -803,7 +811,7 @@ export default async function (pi: ExtensionAPI) {
 				isConnected = true;
 				discoveryStatus = "connected";
 				lastDiscoveryError = undefined;
-				registerNineRouterProvider(pi, discoveryConfig, models, metadataIndex);
+				registerNineRouterProvider(pi, { ...discoveryConfig, enableReasoning: config.enableReasoning }, models, metadataIndex);
 			}
 			return models;
 		} finally {
@@ -821,10 +829,11 @@ export default async function (pi: ExtensionAPI) {
 				return;
 			}
 
+			const webRefresh = beginWebRouteRefresh(discovery.config);
 			try {
-				await refreshWebRoutes(discovery.config, discovery.generation, undefined, STARTUP_DISCOVERY_TIMEOUT_MS);
+				await refreshWebRoutes(webRefresh.config, webRefresh.generation, undefined, STARTUP_DISCOVERY_TIMEOUT_MS);
 			} catch (err) {
-				if (isCurrentDiscovery(discovery.generation)) {
+				if (isCurrentWebRouteRefresh(webRefresh.generation)) {
 					console.warn(`[pi-9router-ext] ${reason} web route discovery skipped: ${conciseConnectionMessage(err)}`);
 				}
 			}
@@ -1036,8 +1045,9 @@ export default async function (pi: ExtensionAPI) {
 					const discovery = beginDiscovery();
 					try {
 						const models = await refreshModels(discovery.config, discovery.generation, ctx.signal);
-						await refreshWebRoutes(discovery.config, discovery.generation, ctx.signal).catch((err) => {
-							if (isCurrentDiscovery(discovery.generation)) {
+						const webRefresh = beginWebRouteRefresh(discovery.config);
+						await refreshWebRoutes(webRefresh.config, webRefresh.generation, ctx.signal).catch((err) => {
+							if (isCurrentWebRouteRefresh(webRefresh.generation)) {
 								console.warn(`[pi-9router-ext] Failed to refresh web routes: ${conciseConnectionMessage(err)}`);
 							}
 						});
@@ -1066,15 +1076,13 @@ export default async function (pi: ExtensionAPI) {
 				}
 
 				if (choice === "Web defaults") {
-					const discovery = beginDiscovery();
+					const webRefresh = beginWebRouteRefresh();
 					try {
-						await refreshWebRoutes(discovery.config, discovery.generation, ctx.signal);
+						await refreshWebRoutes(webRefresh.config, webRefresh.generation, ctx.signal);
 					} catch (err) {
-						finishDiscovery(discovery.generation);
 						ctx.ui.notify(`Failed to refresh web routes: ${conciseConnectionMessage(err)}`, isAuthError(err) ? "warning" : "error");
 						continue;
 					}
-					finishDiscovery(discovery.generation);
 
 					const searchRoutes = routesByKind(discoveredWebRoutes, "webSearch");
 					const fetchRoutes = routesByKind(discoveredWebRoutes, "webFetch");
@@ -1160,7 +1168,6 @@ export default async function (pi: ExtensionAPI) {
 				enableReasoning: choice === "Enable reasoning",
 			};
 			persistConfig(pi, config);
-			cancelPendingDiscovery();
 
 			if (discoveredModels.length > 0) {
 				registerNineRouterProvider(pi, config, discoveredModels, modelMetadataIndex);
@@ -1185,8 +1192,9 @@ export default async function (pi: ExtensionAPI) {
 			try {
 				const models = await refreshModels(discovery.config, discovery.generation, ctx.signal);
 
-				await refreshWebRoutes(discovery.config, discovery.generation, ctx.signal).catch((err) => {
-					if (isCurrentDiscovery(discovery.generation)) {
+				const webRefresh = beginWebRouteRefresh(discovery.config);
+				await refreshWebRoutes(webRefresh.config, webRefresh.generation, ctx.signal).catch((err) => {
+					if (isCurrentWebRouteRefresh(webRefresh.generation)) {
 						console.warn(`[pi-9router-ext] Failed to reload web routes: ${conciseConnectionMessage(err)}`);
 					}
 				});
