@@ -106,7 +106,7 @@ const STARTUP_DISCOVERY_TIMEOUT_MS = 5_000;
 const CUSTOM_TYPE_CONFIG = "9router-config";
 const CUSTOM_TYPE_LAST_ROUTE = "9router-last-route";
 const FALLBACK_CONTEXT_WINDOW = 128000;
-const FALLBACK_MAX_TOKENS = 16384;
+const FALLBACK_MAX_TOKENS = 4096;
 
 // Headers that may indicate the actual upstream model used
 const ROUTING_HEADERS = [
@@ -202,7 +202,9 @@ function getInitialConfig(): NineRouterConfig {
 }
 
 function loadConfigFromSession(ctx: ExtensionContext): NineRouterConfig | null {
-	for (const entry of ctx.sessionManager.getEntries()) {
+	const entries = ctx.sessionManager.getEntries();
+	for (let i = entries.length - 1; i >= 0; i -= 1) {
+		const entry = entries[i];
 		if (entry.type === "custom" && entry.customType === CUSTOM_TYPE_CONFIG) {
 			const data = entry.data as Partial<NineRouterConfig> | undefined;
 			if (data?.baseUrl) {
@@ -485,15 +487,22 @@ async function testConnection(
 			headers.Authorization = `Bearer ${config.apiKey}`;
 		}
 
-		const response = await fetchWithTimeout(`${config.baseUrl}/v1/models`, {
-			method: "GET",
-			headers,
-		}, signal, timeoutMs);
-
-		if (response.ok) {
-			return { ok: true };
-		}
-		return { ok: false, error: `HTTP ${response.status}: ${response.statusText}` };
+		return await fetchWithTimedBody(
+			`${config.baseUrl}/v1/models`,
+			{
+				method: "GET",
+				headers,
+			},
+			signal,
+			timeoutMs,
+			async (response) => {
+				const text = await response.text().catch(() => "");
+				if (response.ok) {
+					return { ok: true };
+				}
+				return { ok: false, error: `HTTP ${response.status}: ${text || response.statusText}` };
+			},
+		);
 	} catch (err) {
 		return { ok: false, error: err instanceof Error ? err.message : String(err) };
 	}
@@ -796,6 +805,8 @@ export default async function (pi: ExtensionAPI) {
 
 	function beginDiscovery() {
 		discoveryGeneration += 1;
+		webRouteGeneration += 1;
+		discoveredWebRoutes = [];
 		isDiscovering = true;
 		discoveryStatus = "discovering";
 		return {

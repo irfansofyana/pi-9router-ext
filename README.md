@@ -89,7 +89,7 @@ Web search/fetch defaults are configured from discovered `GET /v1/models/web` ro
 
 ### Model Limits and Metadata
 
-9router-compatible `/v1/models` responses may only include `id`, `object`, and `owned_by`. When context/output limits are absent, the extension fills them from cached models.dev metadata at `~/.cache/pi/9router-model-metadata.json` (or `$XDG_CACHE_HOME/pi/9router-model-metadata.json`). Router-provided fields still take priority when available. If neither source has metadata, safe defaults are used: `128000` context tokens and `16384` output tokens.
+9router-compatible `/v1/models` responses may only include `id`, `object`, and `owned_by`. When context/output limits are absent, the extension fills them from cached models.dev metadata at `~/.cache/pi/9router-model-metadata.json` (or `$XDG_CACHE_HOME/pi/9router-model-metadata.json`). Router-provided fields still take priority when available. If neither source has metadata, safe defaults are used: `128000` context tokens and a conservative `4096` output tokens.
 
 ## Usage
 
