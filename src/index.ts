@@ -330,13 +330,25 @@ function writeMetadataCache(data: unknown) {
 function normalizeModelId(id: string): string {
 	return id
 		.toLowerCase()
-		.replace(/[:@].*$/, "")
+		// Keep namespace colons such as `hf:org/model`; only strip known route variants.
+		.replace(/:(free)$/i, "")
 		.replace(/-\d{8}$/, "");
+}
+
+function hasColonNamespace(id: string): boolean {
+	const colon = id.indexOf(":");
+	if (colon < 0) return false;
+	const slash = id.indexOf("/");
+	return slash < 0 || colon < slash;
 }
 
 function stripModelPrefix(id: string): string {
 	const slash = id.lastIndexOf("/");
 	return slash >= 0 ? id.slice(slash + 1) : id;
+}
+
+function stripModelPrefixForLookup(id: string): string {
+	return hasColonNamespace(id) ? id : stripModelPrefix(id);
 }
 
 function addMetadataIndexEntry(index: ModelMetadataIndex, key: string, model: ModelMetadata) {
@@ -354,21 +366,22 @@ function buildModelMetadataIndex(api: ModelMetadataApi): ModelMetadataIndex {
 			const indexedModel = { ...model, id: model.id || modelId };
 			addMetadataIndexEntry(index, modelId, indexedModel);
 			addMetadataIndexEntry(index, indexedModel.id, indexedModel);
-			addMetadataIndexEntry(index, stripModelPrefix(modelId), indexedModel);
-			addMetadataIndexEntry(index, stripModelPrefix(indexedModel.id), indexedModel);
+			addMetadataIndexEntry(index, stripModelPrefixForLookup(modelId), indexedModel);
+			addMetadataIndexEntry(index, stripModelPrefixForLookup(indexedModel.id), indexedModel);
 		}
 	}
 	return index;
 }
 
 function lookupModelMetadata(id: string, index: ModelMetadataIndex): ModelMetadata | undefined {
-	const candidates = [id, stripModelPrefix(id), normalizeModelId(id), normalizeModelId(stripModelPrefix(id))];
+	const stripped = stripModelPrefixForLookup(id);
+	const candidates = [id, stripped, normalizeModelId(id), normalizeModelId(stripped)];
 	for (const candidate of candidates) {
 		const match = index.get(candidate);
 		if (match) return match;
 	}
 
-	const normalized = normalizeModelId(stripModelPrefix(id));
+	const normalized = normalizeModelId(stripped);
 	for (const [key, model] of index) {
 		const normalizedKey = normalizeModelId(key);
 		if (normalizedKey.startsWith(normalized) || normalized.startsWith(normalizedKey)) {
