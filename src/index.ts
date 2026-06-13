@@ -293,6 +293,16 @@ function conciseConnectionMessage(err: unknown): string {
 	return message;
 }
 
+function staleDiscoveryError(): Error {
+	const err = new Error("stale discovery result");
+	err.name = "StaleDiscoveryError";
+	return err;
+}
+
+function isStaleDiscoveryError(err: unknown): boolean {
+	return err instanceof Error && err.name === "StaleDiscoveryError";
+}
+
 // =============================================================================
 // Model Metadata
 // =============================================================================
@@ -805,14 +815,15 @@ export default async function (pi: ExtensionAPI) {
 			if (models.length === 0) {
 				throw new Error("no models returned by /v1/models");
 			}
-			if (isCurrentDiscovery(generation)) {
-				discoveredModels = models;
-				modelMetadataIndex = metadataIndex;
-				isConnected = true;
-				discoveryStatus = "connected";
-				lastDiscoveryError = undefined;
-				registerNineRouterProvider(pi, { ...discoveryConfig, enableReasoning: config.enableReasoning }, models, metadataIndex);
+			if (!isCurrentDiscovery(generation)) {
+				throw staleDiscoveryError();
 			}
+			discoveredModels = models;
+			modelMetadataIndex = metadataIndex;
+			isConnected = true;
+			discoveryStatus = "connected";
+			lastDiscoveryError = undefined;
+			registerNineRouterProvider(pi, { ...discoveryConfig, enableReasoning: config.enableReasoning }, models, metadataIndex);
 			return models;
 		} finally {
 			finishDiscovery(generation);
@@ -825,6 +836,7 @@ export default async function (pi: ExtensionAPI) {
 			try {
 				await refreshModels(discovery.config, discovery.generation, undefined, STARTUP_DISCOVERY_TIMEOUT_MS);
 			} catch (err) {
+				if (isStaleDiscoveryError(err)) return;
 				markDiscoveryFailure(err, `${reason} model discovery skipped`, discovery.generation);
 				return;
 			}
@@ -1053,6 +1065,7 @@ export default async function (pi: ExtensionAPI) {
 						});
 						ctx.ui.notify(`9router connection updated — ${models.length} models`, "info");
 					} catch (err) {
+						if (isStaleDiscoveryError(err)) continue;
 						markDiscoveryFailure(err, "connection update failed", discovery.generation);
 						ctx.ui.notify(`Failed to connect: ${discoveryStatusLine()}`, isAuthError(err) ? "warning" : "error");
 					}
@@ -1204,6 +1217,7 @@ export default async function (pi: ExtensionAPI) {
 					"info",
 				);
 			} catch (err) {
+				if (isStaleDiscoveryError(err)) return;
 				markDiscoveryFailure(err, "reload failed", discovery.generation);
 				ctx.ui.notify(`Reload failed: ${discoveryStatusLine()}`, isAuthError(err) ? "warning" : "error");
 			}
