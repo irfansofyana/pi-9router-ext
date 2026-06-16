@@ -73,6 +73,13 @@ interface NineRouterModelsResponse {
 	data: NineRouterModel[];
 }
 
+interface NineRouterDiscoveryCache {
+	baseUrl: string;
+	ts: number;
+	models: NineRouterModel[];
+	webRoutes?: NineRouterWebRoute[];
+}
+
 interface ModelMetadata {
 	id: string;
 	name?: string;
@@ -98,6 +105,7 @@ const ENV_ENABLE_REASONING = process.env.NINE_ROUTER_ENABLE_REASONING;
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "9router-config.json");
 const CACHE_DIR = join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "pi");
 const MODEL_METADATA_CACHE_PATH = join(CACHE_DIR, "9router-model-metadata.json");
+const DISCOVERY_CACHE_PATH = join(CACHE_DIR, "9router-discovery-cache.json");
 const MODEL_METADATA_URL = "https://models.dev/api.json";
 const MODEL_METADATA_TTL_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -230,6 +238,52 @@ function persistConfig(pi: ExtensionAPI, config: NineRouterConfig) {
 		webSearchRoute: config.webSearchRoute,
 		webFetchRoute: config.webFetchRoute,
 	});
+}
+
+function isCachedModel(value: unknown): value is NineRouterModel {
+	return isRecord(value) && typeof value.id === "string" && value.id.trim().length > 0;
+}
+
+function readDiscoveryCache(config: NineRouterConfig): NineRouterDiscoveryCache | undefined {
+	try {
+		if (!existsSync(DISCOVERY_CACHE_PATH)) return undefined;
+		const cache = JSON.parse(readFileSync(DISCOVERY_CACHE_PATH, "utf8")) as Partial<NineRouterDiscoveryCache>;
+		if (normalizeBaseUrl(String(cache.baseUrl || "")) !== config.baseUrl) return undefined;
+		if (!Array.isArray(cache.models) || cache.models.length === 0) return undefined;
+		return {
+			baseUrl: config.baseUrl,
+			ts: typeof cache.ts === "number" ? cache.ts : 0,
+			models: cache.models.filter(isCachedModel),
+			webRoutes: Array.isArray(cache.webRoutes) ? cache.webRoutes : undefined,
+		};
+	} catch (err) {
+		console.warn(`[pi-9router-ext] Failed to load discovery cache: ${errorMessage(err)}`);
+		return undefined;
+	}
+}
+
+function writeDiscoveryCache(
+	config: NineRouterConfig,
+	models: NineRouterModel[],
+	webRoutes?: NineRouterWebRoute[],
+) {
+	if (models.length === 0) return;
+	try {
+		const existing = readDiscoveryCache(config);
+		mkdirSync(dirname(DISCOVERY_CACHE_PATH), { recursive: true });
+		writeFileSync(
+			DISCOVERY_CACHE_PATH,
+			`${JSON.stringify({
+				baseUrl: config.baseUrl,
+				ts: Date.now(),
+				models,
+				webRoutes: webRoutes ?? existing?.webRoutes,
+			}, null, 2)}\n`,
+			{ mode: 0o600 },
+		);
+	} catch (err) {
+		console.warn(`[pi-9router-ext] Failed to persist discovery cache: ${errorMessage(err)}`);
+	}
 }
 
 // =============================================================================
@@ -407,6 +461,11 @@ function lookupModelMetadata(id: string, index: ModelMetadataIndex): ModelMetada
 		}
 	}
 	return undefined;
+}
+
+function readCachedModelMetadataIndex(): ModelMetadataIndex {
+	const cached = readMetadataCache();
+	return cached ? buildModelMetadataIndex((cached.data as ModelMetadataApi) || {}) : new Map();
 }
 
 async function fetchModelMetadataIndex(signal?: AbortSignal, timeoutMs = REQUEST_TIMEOUT_MS): Promise<ModelMetadataIndex> {
@@ -800,18 +859,25 @@ export default async function (pi: ExtensionAPI) {
 	let discoveryStatus: DiscoveryStatus = "idle";
 	let lastDiscoveryError: string | undefined;
 	let isDiscovering = false;
+	let providerRegistration: { baseUrl: string; apiKey: string | undefined } | undefined;
 	let discoveryGeneration = 0;
 	let webRouteGeneration = 0;
 
 	function beginDiscovery() {
 		discoveryGeneration += 1;
 		webRouteGeneration += 1;
-		discoveredWebRoutes = [];
 		isDiscovering = true;
 		discoveryStatus = "discovering";
 		return {
 			generation: discoveryGeneration,
 			config: { ...config },
+		};
+	}
+
+	function setProviderRegistration(discoveryConfig: NineRouterConfig) {
+		providerRegistration = {
+			baseUrl: discoveryConfig.baseUrl,
+			apiKey: discoveryConfig.apiKey,
 		};
 	}
 
@@ -842,7 +908,17 @@ export default async function (pi: ExtensionAPI) {
 		isConnected = false;
 		discoveryStatus = connectionFailureStatus(err);
 		lastDiscoveryError = conciseConnectionMessage(err);
-		unregisterNineRouterProvider(pi);
+		// Unregister the previous provider whenever the user changed baseUrl or
+		// apiKey and the new credential was rejected. Keeping the old
+		// registration would silently continue using credentials the user just
+		// removed/rotated. Also unregister on a cold start (no prior models).
+		const registrationChanged = !providerRegistration
+			|| providerRegistration.baseUrl !== config.baseUrl
+			|| providerRegistration.apiKey !== config.apiKey;
+		if (discoveredModels.length === 0 || registrationChanged) {
+			unregisterNineRouterProvider(pi);
+			providerRegistration = undefined;
+		}
 		console.warn(`[pi-9router-ext] ${context}: ${lastDiscoveryError}`);
 	}
 
@@ -850,6 +926,7 @@ export default async function (pi: ExtensionAPI) {
 		const routes = await fetchWebRoutes(discoveryConfig, signal, timeoutMs);
 		if (isCurrentWebRouteRefresh(generation)) {
 			discoveredWebRoutes = routes;
+			writeDiscoveryCache(discoveryConfig, discoveredModels, routes);
 		}
 		return routes;
 	}
@@ -872,6 +949,8 @@ export default async function (pi: ExtensionAPI) {
 			discoveryStatus = "connected";
 			lastDiscoveryError = undefined;
 			registerNineRouterProvider(pi, { ...discoveryConfig, enableReasoning: config.enableReasoning }, models, metadataIndex);
+			setProviderRegistration(discoveryConfig);
+			writeDiscoveryCache(discoveryConfig, models, discoveredWebRoutes);
 			return models;
 		} finally {
 			finishDiscovery(generation);
@@ -914,11 +993,35 @@ export default async function (pi: ExtensionAPI) {
 		() => discoveredWebRoutes,
 	);
 
+	const cachedDiscovery = readDiscoveryCache(config);
+	if (cachedDiscovery && cachedDiscovery.models.length > 0) {
+		discoveredModels = cachedDiscovery.models;
+		discoveredWebRoutes = cachedDiscovery.webRoutes ?? [];
+		modelMetadataIndex = readCachedModelMetadataIndex();
+		registerNineRouterProvider(pi, config, discoveredModels, modelMetadataIndex);
+		setProviderRegistration(config);
+		startBackgroundDiscovery("startup");
+	} else {
+		const discovery = beginDiscovery();
+		try {
+			await refreshModels(discovery.config, discovery.generation, undefined, STARTUP_DISCOVERY_TIMEOUT_MS);
+			const webRefresh = beginWebRouteRefresh(discovery.config);
+			void refreshWebRoutes(webRefresh.config, webRefresh.generation, undefined, STARTUP_DISCOVERY_TIMEOUT_MS).catch((err) => {
+				if (isCurrentWebRouteRefresh(webRefresh.generation)) {
+					console.warn(`[pi-9router-ext] startup web route discovery skipped: ${conciseConnectionMessage(err)}`);
+				}
+			});
+		} catch (err) {
+			if (!isStaleDiscoveryError(err)) {
+				markDiscoveryFailure(err, "startup model discovery skipped", discovery.generation);
+			}
+		}
+	}
+
 	// ---------------------------------------------------------------------------
-	// Provider registration happens in background so Pi remains usable even when
-	// 9router is not configured, unreachable, or slow during first install.
+	// Models are registered before Pi resolves saved scoped models. Cached models
+	// keep startup fast; first run waits briefly so Ctrl+S scopes can persist.
 	// ---------------------------------------------------------------------------
-	startBackgroundDiscovery("startup");
 
 	// ---------------------------------------------------------------------------
 	// Session start: rehydrate config from session
@@ -1132,6 +1235,7 @@ export default async function (pi: ExtensionAPI) {
 					persistConfig(pi, config);
 					if (discoveredModels.length > 0) {
 						registerNineRouterProvider(pi, config, discoveredModels, modelMetadataIndex);
+						setProviderRegistration(config);
 					}
 					ctx.ui.notify(`9router reasoning ${config.enableReasoning ? "enabled" : "disabled"}`, "info");
 				}
@@ -1232,6 +1336,7 @@ export default async function (pi: ExtensionAPI) {
 
 			if (discoveredModels.length > 0) {
 				registerNineRouterProvider(pi, config, discoveredModels, modelMetadataIndex);
+				setProviderRegistration(config);
 			}
 
 			ctx.ui.notify(
