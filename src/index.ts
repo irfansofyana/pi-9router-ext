@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -320,6 +320,18 @@ function writeDiscoveryCache(
 		);
 	} catch (err) {
 		console.warn(`[pi-9router-ext] Failed to persist discovery cache: ${errorMessage(err)}`);
+	}
+}
+
+function clearDiscoveryCache(config: NineRouterConfig) {
+	try {
+		if (!existsSync(DISCOVERY_CACHE_PATH)) return;
+		const cache = JSON.parse(readFileSync(DISCOVERY_CACHE_PATH, "utf8")) as Partial<NineRouterDiscoveryCache>;
+		if (cacheMatchesConfig(cache, config)) {
+			unlinkSync(DISCOVERY_CACHE_PATH);
+		}
+	} catch (err) {
+		console.warn(`[pi-9router-ext] Failed to clear discovery cache: ${errorMessage(err)}`);
 	}
 }
 
@@ -950,16 +962,25 @@ export default async function (pi: ExtensionAPI) {
 		isConnected = false;
 		discoveryStatus = connectionFailureStatus(err);
 		lastDiscoveryError = conciseConnectionMessage(err);
-		// Unregister the previous provider whenever the user changed baseUrl or
-		// apiKey and the new credential was rejected. Keeping the old
-		// registration would silently continue using credentials the user just
-		// removed/rotated. Also unregister on a cold start (no prior models).
+		// Auth failures mean the current credential is known unusable, even if it
+		// matches a cached or previously successful registration. Do not keep
+		// offering scoped 9router models backed by credentials the router rejects.
+		// Non-auth failures keep the previous provider only when the baseUrl/apiKey
+		// identity did not change, so transient outages do not break saved scopes.
+		const authFailure = isAuthError(err);
 		const registrationChanged = !providerRegistration
 			|| providerRegistration.baseUrl !== config.baseUrl
 			|| providerRegistration.apiKey !== config.apiKey;
-		if (discoveredModels.length === 0 || registrationChanged) {
+		if (authFailure || discoveredModels.length === 0 || registrationChanged) {
 			unregisterNineRouterProvider(pi);
 			providerRegistration = undefined;
+			if (authFailure) {
+				discoveredModels = [];
+				modelMetadataIndex = new Map();
+				discoveredWebRoutes = [];
+				discoveredWebRoutesIdentity = undefined;
+				clearDiscoveryCache(config);
+			}
 		}
 		console.warn(`[pi-9router-ext] ${context}: ${lastDiscoveryError}`);
 	}
