@@ -16,6 +16,7 @@
  *   NINE_ROUTER_ENABLE_REASONING - expose Pi thinking levels and send reasoning_effort
  */
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -73,8 +74,14 @@ interface NineRouterModelsResponse {
 	data: NineRouterModel[];
 }
 
+interface ConfigIdentity {
+	baseUrl: string;
+	apiKeyHash: string;
+}
+
 interface NineRouterDiscoveryCache {
 	baseUrl: string;
+	apiKeyHash?: string;
 	ts: number;
 	models: NineRouterModel[];
 	webRoutes?: NineRouterWebRoute[];
@@ -244,14 +251,43 @@ function isCachedModel(value: unknown): value is NineRouterModel {
 	return isRecord(value) && typeof value.id === "string" && value.id.trim().length > 0;
 }
 
+function apiKeyHash(apiKey: string | undefined): string {
+	return apiKey
+		? `sha256:${createHash("sha256").update(apiKey).digest("hex")}`
+		: "none";
+}
+
+function configIdentity(config: NineRouterConfig): ConfigIdentity {
+	return {
+		baseUrl: config.baseUrl,
+		apiKeyHash: apiKeyHash(config.apiKey),
+	};
+}
+
+function sameConfigIdentity(identity: ConfigIdentity | undefined, config: NineRouterConfig): boolean {
+	if (!identity) return false;
+	const current = configIdentity(config);
+	return identity.baseUrl === current.baseUrl && identity.apiKeyHash === current.apiKeyHash;
+}
+
+function cacheMatchesConfig(cache: Partial<NineRouterDiscoveryCache>, config: NineRouterConfig): boolean {
+	if (normalizeBaseUrl(String(cache.baseUrl || "")) !== config.baseUrl) return false;
+	// Legacy caches did not store a credential fingerprint. Trust them only for
+	// unauthenticated routers; authenticated caches must be tied to the apiKey
+	// hash so rotating/removing credentials does not reuse old verified models.
+	if (typeof cache.apiKeyHash !== "string") return !config.apiKey;
+	return cache.apiKeyHash === apiKeyHash(config.apiKey);
+}
+
 function readDiscoveryCache(config: NineRouterConfig): NineRouterDiscoveryCache | undefined {
 	try {
 		if (!existsSync(DISCOVERY_CACHE_PATH)) return undefined;
 		const cache = JSON.parse(readFileSync(DISCOVERY_CACHE_PATH, "utf8")) as Partial<NineRouterDiscoveryCache>;
-		if (normalizeBaseUrl(String(cache.baseUrl || "")) !== config.baseUrl) return undefined;
+		if (!cacheMatchesConfig(cache, config)) return undefined;
 		if (!Array.isArray(cache.models) || cache.models.length === 0) return undefined;
 		return {
 			baseUrl: config.baseUrl,
+			apiKeyHash: apiKeyHash(config.apiKey),
 			ts: typeof cache.ts === "number" ? cache.ts : 0,
 			models: cache.models.filter(isCachedModel),
 			webRoutes: Array.isArray(cache.webRoutes) ? cache.webRoutes : undefined,
@@ -275,6 +311,7 @@ function writeDiscoveryCache(
 			DISCOVERY_CACHE_PATH,
 			`${JSON.stringify({
 				baseUrl: config.baseUrl,
+				apiKeyHash: apiKeyHash(config.apiKey),
 				ts: Date.now(),
 				models,
 				webRoutes: webRoutes ?? existing?.webRoutes,
@@ -853,6 +890,7 @@ export default async function (pi: ExtensionAPI) {
 	let discoveredModels: NineRouterModel[] = [];
 	let modelMetadataIndex: ModelMetadataIndex = new Map();
 	let discoveredWebRoutes: NineRouterWebRoute[] = [];
+	let discoveredWebRoutesIdentity: ConfigIdentity | undefined;
 	let lastRoutedModel: string | undefined;
 	let activeProvider: string | undefined;
 	let isConnected = false;
@@ -866,6 +904,10 @@ export default async function (pi: ExtensionAPI) {
 	function beginDiscovery() {
 		discoveryGeneration += 1;
 		webRouteGeneration += 1;
+		if (!sameConfigIdentity(discoveredWebRoutesIdentity, config)) {
+			discoveredWebRoutes = [];
+			discoveredWebRoutesIdentity = undefined;
+		}
 		isDiscovering = true;
 		discoveryStatus = "discovering";
 		return {
@@ -926,6 +968,7 @@ export default async function (pi: ExtensionAPI) {
 		const routes = await fetchWebRoutes(discoveryConfig, signal, timeoutMs);
 		if (isCurrentWebRouteRefresh(generation)) {
 			discoveredWebRoutes = routes;
+			discoveredWebRoutesIdentity = configIdentity(discoveryConfig);
 			writeDiscoveryCache(discoveryConfig, discoveredModels, routes);
 		}
 		return routes;
@@ -950,7 +993,11 @@ export default async function (pi: ExtensionAPI) {
 			lastDiscoveryError = undefined;
 			registerNineRouterProvider(pi, { ...discoveryConfig, enableReasoning: config.enableReasoning }, models, metadataIndex);
 			setProviderRegistration(discoveryConfig);
-			writeDiscoveryCache(discoveryConfig, models, discoveredWebRoutes);
+			writeDiscoveryCache(
+				discoveryConfig,
+				models,
+				sameConfigIdentity(discoveredWebRoutesIdentity, discoveryConfig) ? discoveredWebRoutes : undefined,
+			);
 			return models;
 		} finally {
 			finishDiscovery(generation);
@@ -997,6 +1044,7 @@ export default async function (pi: ExtensionAPI) {
 	if (cachedDiscovery && cachedDiscovery.models.length > 0) {
 		discoveredModels = cachedDiscovery.models;
 		discoveredWebRoutes = cachedDiscovery.webRoutes ?? [];
+		discoveredWebRoutesIdentity = Array.isArray(cachedDiscovery.webRoutes) ? configIdentity(config) : undefined;
 		modelMetadataIndex = readCachedModelMetadataIndex();
 		registerNineRouterProvider(pi, config, discoveredModels, modelMetadataIndex);
 		setProviderRegistration(config);
