@@ -899,7 +899,13 @@ function registerNineRouterProvider(
 }
 
 function unregisterNineRouterProvider(pi: ExtensionAPI) {
-	pi.unregisterProvider("9router");
+    // Check if the unregisterProvider method is supported by the runtime (e.g., native 'pi')
+    if (typeof (pi as any).unregisterProvider === 'function') {
+        (pi as any).unregisterProvider("9router");
+    } else {
+        // If running in 'ohmypi' where the method isn't available yet, skip gracefully without throwing an error
+        console.warn("[pi-9router-ext] unregisterProvider is not supported in this environment, skipping unregister.");
+    }
 }
 
 // =============================================================================
