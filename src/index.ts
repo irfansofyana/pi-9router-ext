@@ -899,7 +899,15 @@ function registerNineRouterProvider(
 }
 
 function unregisterNineRouterProvider(pi: ExtensionAPI) {
-	pi.unregisterProvider("9router");
+	// Upstream Pi exposes unregisterProvider; some hosts (e.g. Oh My Pi / omp)
+	// currently only implement registerProvider. Discovery failure must not crash
+	// extension load on hosts missing the API.
+	const unregister = (pi as ExtensionAPI & {
+		unregisterProvider?: (name: string) => void;
+	}).unregisterProvider;
+	if (typeof unregister === "function") {
+		unregister.call(pi, "9router");
+	}
 }
 
 // =============================================================================
