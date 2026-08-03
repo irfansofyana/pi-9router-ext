@@ -32,6 +32,51 @@ import {
 } from "./web.js";
 
 // =============================================================================
+// Schema Sanitizer for 9router
+// =============================================================================
+
+/**
+ * Strips internal TypeBox schema properties (such as `~optional`, `~kind`, `~readonly`)
+ * from tool parameter declarations before forwarding requests to 9router.
+ * Upstream providers like Google Gemini strictly reject unrecognized properties in
+ * function_declarations.parameters schema payloads with a 400 INVALID_ARGUMENT error.
+ */
+function sanitizeTypeBoxSchema(obj: unknown): unknown {
+	if (obj === null || typeof obj !== "object") return obj;
+	if (Array.isArray(obj)) return obj.map(sanitizeTypeBoxSchema);
+
+	const clean: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+		if (!key.startsWith("~")) {
+			clean[key] = sanitizeTypeBoxSchema(value);
+		}
+	}
+	return clean;
+}
+
+if (!(globalThis as Record<string, unknown>).__pi_9router_fetch_patched) {
+	(globalThis as Record<string, unknown>).__pi_9router_fetch_patched = true;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
+		const urlStr = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+
+		if (init?.body && typeof init.body === "string" && urlStr.includes("/chat/completions")) {
+			try {
+				const body = JSON.parse(init.body) as Record<string, unknown>;
+				if (body.tools && Array.isArray(body.tools)) {
+					body.tools = sanitizeTypeBoxSchema(body.tools);
+					init = { ...init, body: JSON.stringify(body) };
+				}
+			} catch {
+				// Non-JSON or unparseable body
+			}
+		}
+
+		return originalFetch.call(this, input, init);
+	};
+}
+
+// =============================================================================
 // Types
 // =============================================================================
 
