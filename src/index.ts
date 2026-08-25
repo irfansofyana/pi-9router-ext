@@ -113,6 +113,8 @@ const CONFIG_PATH = join(homedir(), ".pi", "agent", "9router-config.json");
 const CACHE_DIR = join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "pi");
 const MODEL_METADATA_CACHE_PATH = join(CACHE_DIR, "9router-model-metadata.json");
 const DISCOVERY_CACHE_PATH = join(CACHE_DIR, "9router-discovery-cache.json");
+const MODELS_JSON_PATH = join(homedir(), ".pi", "agent", "models.json");
+const ROUTER_MODEL_CACHE_PATH = join(CACHE_DIR, "9router.json");
 const MODEL_METADATA_URL = "https://models.dev/api.json";
 const MODEL_METADATA_TTL_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -368,6 +370,108 @@ function clearDiscoveryCache(config: NineRouterConfig) {
 		}
 	} catch (err) {
 		console.warn(`[pi-9router-ext] Failed to clear discovery cache: ${errorMessage(err)}`);
+	}
+}
+
+function readModelsFromConfig(): NineRouterModel[] | undefined {
+	try {
+		if (!existsSync(MODELS_JSON_PATH)) return undefined;
+		const data = JSON.parse(readFileSync(MODELS_JSON_PATH, "utf8"));
+		const providers = data?.providers;
+		if (!providers || typeof providers !== "object") return undefined;
+		const p = providers["9router"];
+		if (!p || typeof p !== "object") return undefined;
+		if (!Array.isArray(p.models) || p.models.length === 0) return undefined;
+		return p.models.filter(isCachedModel);
+	} catch {
+		return undefined;
+	}
+}
+
+// Persist models in Pi's normalized "custom model" provider format so that
+// ~/.pi/agent/models.json is directly consumable (baseUrl/api/apiKey at the
+// provider level, rich model entries) rather than the raw /v1/models catalog.
+// Per-model context windows / max tokens / capabilities are taken from the
+// router cache (~/.cache/pi/9router.json) when available, otherwise generic
+// defaults are applied (128k context, 32k output).
+function loadRouterModelCache(): Map<string, NineRouterModel> {
+	try {
+		if (!existsSync(ROUTER_MODEL_CACHE_PATH)) return new Map();
+		const parsed = JSON.parse(readFileSync(ROUTER_MODEL_CACHE_PATH, "utf8")) as {
+			data?: { data?: unknown };
+		};
+		const list = parsed?.data?.data;
+		if (!Array.isArray(list)) return new Map();
+		const map = new Map<string, NineRouterModel>();
+		for (const entry of list) {
+			if (isCachedModel(entry)) map.set(entry.id, entry);
+		}
+		return map;
+	} catch {
+		return new Map();
+	}
+}
+
+// Merge the richer router cache entry (context_length, max_completion_tokens,
+// capabilities, owned_by) into a discovered model so the catalog reflects the
+// real limits/modalities rather than generic defaults.
+function enrichModelFromCache(model: NineRouterModel, cache: Map<string, NineRouterModel>): NineRouterModel {
+	const cached = cache.get(model.id);
+	if (!cached) return model;
+	return {
+		...model,
+		...(cached.context_length !== undefined ? { context_length: cached.context_length } : {}),
+		...(cached.max_completion_tokens !== undefined ? { max_completion_tokens: cached.max_completion_tokens } : {}),
+		...(cached.capabilities !== undefined ? { capabilities: cached.capabilities } : {}),
+		...(cached.owned_by ? { owned_by: cached.owned_by } : {}),
+	};
+}
+
+function toNormalizedModelEntry(model: NineRouterModel, enableReasoning: boolean) {
+	const advertisedContext = firstTokenCount(model, ROUTER_CONTEXT_PATHS);
+	const advertisedMax = firstTokenCount(model, ROUTER_OUTPUT_PATHS);
+	let maxTokens = advertisedMax ?? 32000;
+	if (isMimoModel(model)) maxTokens = Math.min(maxTokens, MIMO_MAX_COMPLETION_TOKENS);
+
+	const caps = isRecord(model.capabilities) ? model.capabilities : undefined;
+	const input: ("text" | "image")[] = ["text"];
+	if (caps?.vision === true) input.push("image");
+
+	return {
+		id: model.id,
+		name: model.owned_by === "combo" ? `🔀 ${model.id}` : model.id,
+		reasoning: caps?.reasoning === true ? true : enableReasoning,
+		input,
+		contextWindow: advertisedContext ?? FALLBACK_CONTEXT_WINDOW,
+		maxTokens,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		...(model.owned_by ? { owned_by: model.owned_by } : {}),
+	};
+}
+
+function writeModelsConfig(models: NineRouterModel[], config: NineRouterConfig) {
+	try {
+		let data: Record<string, unknown> = {};
+		if (existsSync(MODELS_JSON_PATH)) {
+			data = JSON.parse(readFileSync(MODELS_JSON_PATH, "utf8"));
+		}
+		if (!data || typeof data !== "object" || Array.isArray(data)) {
+			data = {};
+		}
+		const providers = (typeof data.providers === "object" && data.providers && !Array.isArray(data.providers))
+			? data.providers
+			: {};
+		(providers as Record<string, unknown>)["9router"] = {
+			baseUrl: `${normalizeBaseUrl(config.baseUrl)}/v1`,
+			api: "openai-completions",
+			apiKey: config.apiKey || "9router-no-api-key",
+			models: models.map((m) => toNormalizedModelEntry(m, config.enableReasoning)),
+		};
+		data.providers = providers;
+		mkdirSync(dirname(MODELS_JSON_PATH), { recursive: true });
+		writeFileSync(MODELS_JSON_PATH, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+	} catch (err) {
+		console.error("[pi-9router-ext] Failed to write models.json:", err);
 	}
 }
 
@@ -922,7 +1026,13 @@ function registerNineRouterProvider(
 }
 
 function unregisterNineRouterProvider(pi: ExtensionAPI) {
-	pi.unregisterProvider("9router");
+    // Check if the unregisterProvider method is supported by the runtime (e.g., native 'pi')
+    if (typeof (pi as any).unregisterProvider === 'function') {
+        (pi as any).unregisterProvider("9router");
+    } else {
+        // If running in 'ohmypi' where the method isn't available yet, skip gracefully without throwing an error
+        console.warn("[pi-9router-ext] unregisterProvider is not supported in this environment, skipping unregister.");
+    }
 }
 
 // =============================================================================
@@ -1098,30 +1208,25 @@ export default async function (pi: ExtensionAPI) {
 		() => discoveredWebRoutes,
 	);
 
+	const has9router = readModelsFromConfig();
 	const cachedDiscovery = readDiscoveryCache(config);
-	if (cachedDiscovery && cachedDiscovery.models.length > 0) {
-		discoveredModels = cachedDiscovery.models;
-		discoveredWebRoutes = cachedDiscovery.webRoutes ?? [];
-		discoveredWebRoutesIdentity = Array.isArray(cachedDiscovery.webRoutes) ? configIdentity(config) : undefined;
+	const hasCache = cachedDiscovery && cachedDiscovery.models.length > 0;
+
+	if (has9router) {
+		discoveredModels = has9router;
 		modelMetadataIndex = readCachedModelMetadataIndex();
 		registerNineRouterProvider(pi, config, discoveredModels, modelMetadataIndex);
 		setProviderRegistration(config);
-		startBackgroundDiscovery("startup");
+		// discoveryStatus stays "idle" — no network was hit
+	} else if (hasCache) {
+		discoveredModels = cachedDiscovery!.models;
+		discoveredWebRoutes = cachedDiscovery!.webRoutes ?? [];
+		discoveredWebRoutesIdentity = Array.isArray(cachedDiscovery!.webRoutes) ? configIdentity(config) : undefined;
+		modelMetadataIndex = readCachedModelMetadataIndex();
+		registerNineRouterProvider(pi, config, discoveredModels, modelMetadataIndex);
+		setProviderRegistration(config);
 	} else {
-		const discovery = beginDiscovery();
-		try {
-			await refreshModels(discovery.config, discovery.generation, undefined, STARTUP_DISCOVERY_TIMEOUT_MS);
-			const webRefresh = beginWebRouteRefresh(discovery.config);
-			void refreshWebRoutes(webRefresh.config, webRefresh.generation, undefined, STARTUP_DISCOVERY_TIMEOUT_MS).catch((err) => {
-				if (isCurrentWebRouteRefresh(webRefresh.generation)) {
-					console.warn(`[pi-9router-ext] startup web route discovery skipped: ${conciseConnectionMessage(err)}`);
-				}
-			});
-		} catch (err) {
-			if (!isStaleDiscoveryError(err)) {
-				markDiscoveryFailure(err, "startup model discovery skipped", discovery.generation);
-			}
-		}
+		// No models.json, no cache. Silent idle — user runs /9router-reload to populate.
 	}
 
 	// ---------------------------------------------------------------------------
@@ -1464,12 +1569,22 @@ export default async function (pi: ExtensionAPI) {
 			try {
 				const models = await refreshModels(discovery.config, discovery.generation, ctx.signal);
 
+				// Enrich with the richer router cache (context_length, max_completion_tokens,
+				// capabilities) so the persisted catalog reflects real limits/modalities.
+				const routerCache = loadRouterModelCache();
+				const enrichedModels = routerCache.size > 0
+					? models.map((m) => enrichModelFromCache(m, routerCache))
+					: models;
+
 				const webRefresh = beginWebRouteRefresh(discovery.config);
 				await refreshWebRoutes(webRefresh.config, webRefresh.generation, ctx.signal).catch((err) => {
 					if (isCurrentWebRouteRefresh(webRefresh.generation)) {
 						console.warn(`[pi-9router-ext] Failed to reload web routes: ${conciseConnectionMessage(err)}`);
 					}
 				});
+
+				// Persist to models.json for next startup
+				writeModelsConfig(enrichedModels, config);
 
 				ctx.ui.notify(
 					`9router reloaded — ${models.length} models, ${routesByKind(discoveredWebRoutes, "webSearch").length} search routes, ${routesByKind(discoveredWebRoutes, "webFetch").length} fetch routes (${config.enableReasoning ? "reasoning enabled" : "reasoning disabled"})`,
