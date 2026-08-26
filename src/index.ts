@@ -129,6 +129,8 @@ const FALLBACK_MAX_TOKENS = 4096;
 // may resolve a higher maxTokens, causing the client to send max_tokens above
 // the upstream cap and receive a 400 rejection.
 const MIMO_MAX_COMPLETION_TOKENS = 131072;
+// Minimax 
+const MINIMAX_MAX_COMPLETION_TOKENS = 131072;
 // Command Code validates max_tokens at the gateway and currently rejects
 // values above 200000, even when /v1/models advertises a larger model-native
 // completion limit (for example, 384000 for DeepSeek V4 and 262144 for Kimi).
@@ -137,6 +139,11 @@ const COMMAND_CODE_MAX_COMPLETION_TOKENS = 200000;
 function isMimoModel(model: NineRouterModel): boolean {
 	const id = (model.id || "").toLowerCase();
 	return id.includes("mimo");
+}
+
+function isMinimaxModel(model: NineRouterModel): boolean {
+	const id = (model.id || "").toLowerCase();
+	return id.includes("minimax");
 }
 
 function isCommandCodeModel(model: NineRouterModel): boolean {
@@ -148,6 +155,7 @@ function isCommandCodeModel(model: NineRouterModel): boolean {
 function modelCompletionTokenCap(model: NineRouterModel): number {
 	let cap = Infinity;
 	if (isMimoModel(model)) cap = Math.min(cap, MIMO_MAX_COMPLETION_TOKENS);
+	if (isMinimaxModel(model)) cap = Math.min(cap, MINIMAX_MAX_COMPLETION_TOKENS);
 	if (isCommandCodeModel(model)) cap = Math.min(cap, COMMAND_CODE_MAX_COMPLETION_TOKENS);
 	return cap;
 }
