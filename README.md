@@ -119,7 +119,7 @@ If your selected 9router route/model supports reasoning, enable the manual toggl
 /9router-reasoning
 ```
 
-When enabled, Pi treats 9router models as reasoning-capable. Use Pi's normal thinking controls such as Shift+Tab, `--thinking high`, or model suffixes like `9router/cx/gpt-5.3-codex:high`. Pi sends OpenAI-style `reasoning_effort` values to 9router (`off → none`, `low`, `medium`, `high`, `xhigh`).
+When enabled, Pi treats 9router models as reasoning-capable. Use Pi's normal thinking controls such as Shift+Tab, `--thinking high`, or model suffixes like `9router/cx/gpt-5.3-codex:high`. Pi sends OpenAI-style `reasoning_effort` values to 9router (`off → none`, `low`, `medium`, `high`, `xhigh`, `max`).
 
 ### Web Search / Fetch Tools
 
