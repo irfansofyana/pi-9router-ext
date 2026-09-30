@@ -875,6 +875,7 @@ function mapNineRouterModel(model: NineRouterModel, enableReasoning: boolean, me
 				medium: "medium",
 				high: "high",
 				xhigh: "xhigh",
+				max: "max",
 			},
 		} : {}),
 		input: modelInputTypes(metadata),
