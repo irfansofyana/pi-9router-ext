@@ -701,6 +701,10 @@ interface LimitInfo {
 }
 
 const ROUTER_CONTEXT_PATHS = [
+	// 9router publishes the real per-model limits in its `capabilities` block;
+	// the OpenAI-style top-level fields can come from a generic family table
+	// (e.g. every Claude -> 200000/8192) and disagree with it, so read it first.
+	["capabilities", "contextWindow"],
 	["contextWindow"],
 	["context_window"],
 	["contextLength"],
@@ -746,6 +750,7 @@ const ROUTER_CONTEXT_PATHS = [
 ] as const;
 
 const ROUTER_OUTPUT_PATHS = [
+	["capabilities", "maxOutput"],
 	["maxOutputTokens"],
 	["max_output_tokens"],
 	["maxCompletionTokens"],
